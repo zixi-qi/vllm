@@ -120,7 +120,13 @@ class RejectionSampler(nn.Module):
         Returns:
             A list of lists of token IDs.
         """
-        output_token_ids_np = output_token_ids.cpu().numpy()
+        output_token_ids_cpu = torch.empty(output_token_ids.size(),
+                                           dtype=output_token_ids.dtype,
+                                           device="cpu",
+                                           pin_memory=True).copy_(
+                                               output_token_ids,
+                                               non_blocking=True)
+        output_token_ids_np = output_token_ids_cpu.numpy()
         # Create mask for valid tokens.
         valid_mask = ((output_token_ids_np != PLACEHOLDER_TOKEN_ID) &
                       (output_token_ids_np < vocab_size))

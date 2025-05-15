@@ -260,7 +260,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> bool:
         """
         Update the order of requests in the batch based on the attention
-        backend's needs. For example, some attention backends (namely MLA) may 
+        backend's needs. For example, some attention backends (namely MLA) may
         want to separate requests based on if the attention computation will be
         compute-bound or memory-bound.
 
@@ -1273,7 +1273,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 next_token_ids.append(next_token_id)
             next_token_ids = torch.tensor(next_token_ids,
                                           dtype=torch.int32,
-                                          device=self.device)
+                                          pin_memory=True).to(
+                                              device=self.device,
+                                              non_blocking=True)
             eagle_attn_metadata = attn_metadata[self.drafter.attn_layer_name]
 
             if spec_decode_metadata is None:
@@ -1298,8 +1300,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_rejected_tokens = torch.tensor(
                     num_rejected_tokens,
                     dtype=torch.int32,
-                    device=self.device,
-                )
+                    pin_memory=True,
+                ).to(device=self.device, non_blocking=True)
                 cu_num_tokens, token_indices = self.drafter.prepare_inputs(
                     eagle_attn_metadata.query_start_loc,
                     num_rejected_tokens,
