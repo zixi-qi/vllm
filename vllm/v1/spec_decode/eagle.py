@@ -1259,15 +1259,29 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
+        draft_config = self.vllm_config
+
+        # Override attention backend for the draft model when explicitly set.
+        # Default (None) inherits from the target; "auto" auto-selects.
+        if spec_cfg.attention_backend is not None:
+            draft_config = replace(
+                draft_config,
+                attention_config=replace(
+                    draft_config.attention_config,
+                    backend=spec_cfg.draft_attention_backend,
+                ),
+            )
+
         if spec_cfg.moe_backend is not None:
-            return replace(
-                self.vllm_config,
+            draft_config = replace(
+                draft_config,
                 kernel_config=replace(
-                    self.vllm_config.kernel_config,
+                    draft_config.kernel_config,
                     moe_backend=spec_cfg.moe_backend,
                 ),
             )
-        return self.vllm_config
+
+        return draft_config
 
     def _get_model(self) -> nn.Module:
         """

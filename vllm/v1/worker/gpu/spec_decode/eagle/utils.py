@@ -8,13 +8,27 @@ from vllm.model_executor.model_loader import get_model
 
 def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
+    from vllm.config.utils import replace
 
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+
+    # Override attention backend for the draft model when explicitly set.
+    # Default (None) inherits from the target; "auto" auto-selects.
+    draft_vllm_config = vllm_config
+    if speculative_config.attention_backend is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            attention_config=replace(
+                draft_vllm_config.attention_config,
+                backend=speculative_config.draft_attention_backend,
+            ),
+        )
+
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
-            vllm_config=vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
     # Share target embeddings when the draft checkpoint does not include

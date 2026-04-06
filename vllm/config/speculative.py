@@ -5,7 +5,7 @@ import ast
 import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-from pydantic import Field, SkipValidation, model_validator
+from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -98,6 +99,15 @@ class SpeculativeConfig:
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
     takes effect when using the draft model-based speculative method."""
+    attention_backend: AttentionBackendEnum | str | None = None
+    """Attention backend to use for the draft model. When ``None`` (the
+    default), the draft model inherits the target model's
+    ``--attention_config.backend`` setting. Set to ``"auto"`` to let vLLM
+    auto-select a compatible backend for the draft model, which is useful
+    when the draft model has a different attention architecture from the
+    target (e.g. a standard-attention Eagle3 drafter paired with an MLA
+    target model). Can also be set to a specific backend name (e.g.
+    ``"FLASH_ATTN"``)."""
     moe_backend: MoEBackend | None = None
     """MoE backend to use for the draft model. When `None`, the draft model
     inherits the target model's `--moe-backend` setting. Useful when the
@@ -784,6 +794,27 @@ class SpeculativeConfig:
         )
 
         return draft_parallel_config
+
+    @field_validator("attention_backend", mode="before")
+    @classmethod
+    def _validate_attention_backend(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            # "auto" is kept as a string sentinel meaning auto-select.
+            if value.lower() == "auto":
+                return "auto"
+            return AttentionBackendEnum[value.upper()]
+        return value
+
+    @property
+    def draft_attention_backend(self) -> AttentionBackendEnum | None:
+        """Resolve ``attention_backend`` to a value consumable by
+        ``AttentionConfig.backend``.  ``"auto"`` and ``None`` both map to
+        ``None`` (auto-select); an explicit enum value passes through."""
+        if self.attention_backend is None or self.attention_backend == "auto":
+            return None
+        return self.attention_backend  # type: ignore[return-value]
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
