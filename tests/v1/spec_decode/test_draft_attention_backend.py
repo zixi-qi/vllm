@@ -64,6 +64,7 @@ def _make_vllm_config(
 # SpeculativeConfig.attention_backend field validation
 # ---------------------------------------------------------------------------
 
+
 class TestAttentionBackendValidator:
     """Test the field_validator on SpeculativeConfig.attention_backend."""
 
@@ -87,7 +88,8 @@ class TestAttentionBackendValidator:
 
     def test_enum_passthrough(self):
         result = SpeculativeConfig._validate_attention_backend(
-            AttentionBackendEnum.FLASH_ATTN)
+            AttentionBackendEnum.FLASH_ATTN
+        )
         assert result == AttentionBackendEnum.FLASH_ATTN
 
     def test_invalid_backend_raises(self):
@@ -99,6 +101,7 @@ class TestAttentionBackendValidator:
 # SpeculativeConfig.draft_attention_backend property
 # ---------------------------------------------------------------------------
 
+
 class TestDraftAttentionBackendProperty:
     """Test that the draft_attention_backend property resolves correctly."""
 
@@ -106,7 +109,8 @@ class TestDraftAttentionBackendProperty:
         self, attention_backend: str | None = None
     ) -> SpeculativeConfig:
         model_config = ModelConfig(
-            model=model_dir, runner="generate", max_model_len=100)
+            model=model_dir, runner="generate", max_model_len=100
+        )
         return SpeculativeConfig(
             target_model_config=model_config,
             target_parallel_config=ParallelConfig(),
@@ -133,6 +137,7 @@ class TestDraftAttentionBackendProperty:
 # _create_draft_vllm_config attention backend override
 # ---------------------------------------------------------------------------
 
+
 class TestCreateDraftVllmConfig:
     """Test that _create_draft_vllm_config respects attention_backend."""
 
@@ -148,8 +153,7 @@ class TestCreateDraftVllmConfig:
             target_attention_backend=target_backend,
             draft_attention_backend=draft_backend_setting,
         )
-        proposer = EagleProposer(
-            vllm_config=vllm_config, device=DEVICE_TYPE)
+        proposer = EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
         draft_config = proposer._create_draft_vllm_config()
         return draft_config.attention_config.backend
 
@@ -193,9 +197,9 @@ class TestCreateDraftVllmConfig:
             target_attention_backend=AttentionBackendEnum.FLASHINFER_MLA,
             draft_attention_backend="auto",
         )
-        proposer = EagleProposer(
-            vllm_config=vllm_config, device=DEVICE_TYPE)
+        proposer = EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
         proposer._create_draft_vllm_config()
         # Target config should still have the original backend.
-        assert (vllm_config.attention_config.backend
-                == AttentionBackendEnum.FLASHINFER_MLA)
+        assert (
+            vllm_config.attention_config.backend == AttentionBackendEnum.FLASHINFER_MLA
+        )
