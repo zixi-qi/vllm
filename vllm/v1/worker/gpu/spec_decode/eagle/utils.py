@@ -14,8 +14,8 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
 
-    # Override attention backend for the draft model when explicitly set.
-    # Default (None) inherits from the target; "auto" auto-selects.
+    # Override attention and MoE backends for the draft model when explicitly
+    # set. Default (None) inherits from the target; "auto" auto-selects.
     draft_vllm_config = vllm_config
     if speculative_config.attention_backend is not None:
         draft_vllm_config = replace(
@@ -23,6 +23,15 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             attention_config=replace(
                 draft_vllm_config.attention_config,
                 backend=speculative_config.draft_attention_backend,
+            ),
+        )
+
+    if speculative_config.moe_backend is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            kernel_config=replace(
+                draft_vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
             ),
         )
 
