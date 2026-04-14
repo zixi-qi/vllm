@@ -977,6 +977,13 @@ class BaseRenderer(ABC, Generic[_T]):
         if prompt_token_ids is not None:
             # PD disagg fast path: skip chat template rendering and
             # tokenization when pre-tokenized IDs are provided.
+            # This is text-only; multimodal requests must go through
+            # the normal path to attach multi_modal_data/uuids.
+            if len(conversations) != 1:
+                raise ValueError(
+                    "prompt_token_ids fast path only supports a single "
+                    f"conversation, got {len(conversations)}"
+                )
             out_conversations: list[list[ConversationMessage]] = [
                 [dict(msg) for msg in conv]  # type: ignore[arg-type]
                 for conv in conversations
