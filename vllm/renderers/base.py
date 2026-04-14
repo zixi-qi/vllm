@@ -969,25 +969,37 @@ class BaseRenderer(ABC, Generic[_T]):
         tok_params: TokenizeParams | None = None,
         *,
         prompt_extras: dict[str, Any] | None = None,
+        prompt_token_ids: list[int] | None = None,
         skip_mm_cache: bool = False,
     ):
         arrival_time = time.time()
 
-        if tok_params is None:
-            tok_params = self.default_chat_tok_params
+        if prompt_token_ids is not None:
+            # PD disagg fast path: skip chat template rendering and
+            # tokenization when pre-tokenized IDs are provided.
+            out_conversations: list[list[ConversationMessage]] = [
+                [dict(msg) for msg in conv]  # type: ignore[arg-type]
+                for conv in conversations
+            ]
+            tok_prompts: list[TokPrompt] = [
+                TokensPrompt(prompt_token_ids=prompt_token_ids),
+            ]
+        else:
+            if tok_params is None:
+                tok_params = self.default_chat_tok_params
 
-        rendered = [
-            self.render_messages_async(conversation, chat_params)
-            for conversation in conversations
-        ]
+            rendered = [
+                self.render_messages_async(conversation, chat_params)
+                for conversation in conversations
+            ]
 
-        out_conversations = list[list["ConversationMessage"]]()
-        dict_prompts = list[DictPrompt]()
-        for conv, prompt in await asyncio.gather(*rendered):
-            out_conversations.append(conv)
-            dict_prompts.append(prompt)
+            out_conversations = list[list["ConversationMessage"]]()
+            dict_prompts = list[DictPrompt]()
+            for conv, prompt in await asyncio.gather(*rendered):
+                out_conversations.append(conv)
+                dict_prompts.append(prompt)
 
-        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+            tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 

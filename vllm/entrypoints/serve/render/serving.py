@@ -182,6 +182,7 @@ class OpenAIServingRender:
     async def render_chat(
         self,
         request: ChatCompletionRequest,
+        prompt_token_ids: list[int] | None = None,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """Core preprocessing logic for chat requests (no model/engine check).
 
@@ -251,6 +252,7 @@ class OpenAIServingRender:
                 tool_dicts=tool_dicts,
                 tool_parser=tool_parser,
                 reasoning_parser=self.reasoning_parser,
+                prompt_token_ids=prompt_token_ids,
             )
         else:
             # For GPT-OSS.
@@ -510,6 +512,7 @@ class OpenAIServingRender:
         tool_dicts: list[dict[str, Any]] | None = None,
         tool_parser: type[ToolParser] | None = None,
         reasoning_parser: type[ReasoningParser] | None = None,
+        prompt_token_ids: list[int] | None = None,
         *,
         skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
@@ -543,6 +546,7 @@ class OpenAIServingRender:
                 for k in ("mm_processor_kwargs", "cache_salt")
                 if (v := getattr(request, k, None)) is not None
             },
+            prompt_token_ids=prompt_token_ids,
             skip_mm_cache=skip_mm_cache,
         )
 

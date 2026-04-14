@@ -183,12 +183,17 @@ class OpenAIServingChat(OpenAIServing):
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
+        prompt_token_ids: list[int] | None = None,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """
         Validate the model and preprocess a chat completion request.
 
         Delegates preprocessing logic to OpenAIServingRender, adding the
         engine-aware checks (LoRA model validation, engine health).
+
+        Args:
+            prompt_token_ids: Pre-tokenized prompt token IDs from PD prefill.
+                When provided, skips chat template rendering and tokenization.
 
         Returns:
             A tuple of (conversation, engine_inputs) on success,
@@ -205,7 +210,9 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.openai_serving_render.render_chat(request)
+        return await self.openai_serving_render.render_chat(
+            request, prompt_token_ids=prompt_token_ids
+        )
 
     async def create_chat_completion(
         self,
@@ -219,6 +226,19 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        # PD disagg fast path: when the decode side receives pre-tokenized
+        # prompt_token_ids from the prefill response (forwarded by the router),
+        # skip chat template rendering and tokenization.
+        prompt_token_ids = (
+            request.prompt_token_ids
+            if (
+                request.kv_transfer_params
+                and request.kv_transfer_params.get("do_remote_prefill")
+                and request.prompt_token_ids
+            )
+            else None
+        )
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -232,7 +252,10 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
-        result = await self.render_chat_request(request)
+
+        result = await self.render_chat_request(
+            request, prompt_token_ids=prompt_token_ids
+        )
         if isinstance(result, ErrorResponse):
             return result
 
@@ -1529,7 +1552,13 @@ class OpenAIServingChat(OpenAIServing):
             usage=usage,
             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
             prompt_token_ids=(
-                final_res.prompt_token_ids if request.return_token_ids else None
+                final_res.prompt_token_ids
+                if request.return_token_ids
+                or (
+                    final_res.kv_transfer_params
+                    and final_res.kv_transfer_params.get("do_remote_prefill")
+                )
+                else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
         )

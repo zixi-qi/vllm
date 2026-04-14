@@ -337,6 +337,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
+    prompt_token_ids: list[int] | None = Field(
+        default=None,
+        description="Pre-tokenized prompt token IDs from prefill stage. "
+        "When provided with kv_transfer_params.do_remote_prefill, "
+        "skips chat template rendering and tokenization on decode side.",
+    )
+
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(
