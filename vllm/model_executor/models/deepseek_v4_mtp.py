@@ -167,7 +167,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
         # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model — see comment at deepseek_v4.py:1236-1239.
+        # DeepseekV4Model.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
 
         # to map the exact layer index from weights
