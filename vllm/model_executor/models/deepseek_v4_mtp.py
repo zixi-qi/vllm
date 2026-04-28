@@ -35,6 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from .deepseek_mtp import SharedHead
 from .deepseek_v2 import get_spec_layer_idx_from_weight_name
@@ -112,12 +113,29 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
+        self.aux_stream_list = aux_stream_list
+        self.proj_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.mtp_block = DeepseekV4DecoderLayer(
             vllm_config,
             prefix,
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
+
+    def _parallel_eh_proj(
+        self,
+        inputs_embeds: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.aux_stream_list is not None
+        h_states, e_states = maybe_execute_in_parallel(
+            lambda: self.h_proj(previous_hidden_states),
+            lambda: self.e_proj(inputs_embeds),
+            self.proj_events[0],
+            self.proj_events[1],
+            self.aux_stream_list[0],
+        )
+        return h_states.add_(e_states.unsqueeze(-2))
 
     def forward(
         self,
@@ -138,9 +156,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             -1, self.hc_mult, self.config.hidden_size
         )
         previous_hidden_states = self.hnorm(previous_hidden_states)
-        hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
-            inputs_embeds
-        ).unsqueeze(-2)
+        hidden_states = self._parallel_eh_proj(inputs_embeds, previous_hidden_states)
         hidden_states = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
