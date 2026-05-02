@@ -490,41 +490,46 @@ WORKDIR /vllm-workspace
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
-# Install Python and system dependencies
+# Install Python from source and system dependencies
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
-        software-properties-common \
         curl \
         sudo \
         ffmpeg \
         libsm6 \
         libxext6 \
         libgl1 \
-    && if [ ! -z ${DEADSNAKES_MIRROR_URL} ] ; then \
-        if [ ! -z "${DEADSNAKES_GPGKEY_URL}" ] ; then \
-            mkdir -p -m 0755 /etc/apt/keyrings ; \
-            curl -L ${DEADSNAKES_GPGKEY_URL} | gpg --dearmor > /etc/apt/keyrings/deadsnakes.gpg ; \
-            sudo chmod 644 /etc/apt/keyrings/deadsnakes.gpg ; \
-            echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list ; \
-        fi ; \
-    else \
-        for i in 1 2 3; do \
-            add-apt-repository -y ppa:deadsnakes/ppa && break || \
-            { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
-        done ; \
-    fi \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        python${PYTHON_VERSION} \
-        python${PYTHON_VERSION}-dev \
-        python${PYTHON_VERSION}-venv \
         libibverbs-dev \
+        build-essential \
+        libssl-dev \
+        libffi-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        libncurses-dev \
+        liblzma-dev \
+        libgdbm-dev \
+        uuid-dev \
+        tk-dev \
+    && PYTHON_MAJOR_MINOR=${PYTHON_VERSION} \
+    && PYTHON_FULL_VERSION=$(curl -s https://www.python.org/ftp/python/ \
+        | grep -oE "${PYTHON_MAJOR_MINOR}\.[0-9]+" \
+        | sort -t. -k3 -n | uniq \
+        | tail -1) \
+    && echo "Building Python ${PYTHON_FULL_VERSION} from source..." \
+    && curl -fSL https://www.python.org/ftp/python/${PYTHON_FULL_VERSION}/Python-${PYTHON_FULL_VERSION}.tgz -o /tmp/python.tgz \
+    && tar -xzf /tmp/python.tgz -C /tmp \
+    && cd /tmp/Python-${PYTHON_FULL_VERSION} \
+    && ./configure --enable-optimizations --with-ensurepip=install --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && cd / \
+    && rm -rf /tmp/python.tgz /tmp/Python-${PYTHON_FULL_VERSION} \
+    && ln -sf /usr/local/bin/python${PYTHON_MAJOR_MINOR} /usr/bin/python3 \
+    && ln -sf /usr/local/bin/python${PYTHON_MAJOR_MINOR}-config /usr/bin/python3-config \
+    && ln -sf /usr/local/bin/pip${PYTHON_MAJOR_MINOR} /usr/bin/pip \
     && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
-    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
-    && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
-    && rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED \
-    && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
 
 # Install CUDA development tools for runtime JIT compilation
