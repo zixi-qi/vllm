@@ -244,6 +244,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_PP_DISABLE_SAMPLED_TOKEN_BROADCAST: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -1671,6 +1672,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # Disable the PP sampled-token broadcast/receive across pipeline-parallel
+    # ranks under async scheduling. ONLY safe on a prefill-only engine in a
+    # PD-disagg setup, where prev_sampled_token_ids is never consumed
+    # downstream (the first decoded token leaves with the KV transfer to the
+    # decode node). With this set on a unified prefill+decode engine, PP
+    # rank 0 will read uninitialized GPU memory as prev_sampled_token_ids
+    # and produce garbage tokens. Default 0 (off).
+    "VLLM_PP_DISABLE_SAMPLED_TOKEN_BROADCAST": lambda: bool(
+        int(os.getenv("VLLM_PP_DISABLE_SAMPLED_TOKEN_BROADCAST", "0"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
