@@ -73,6 +73,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -81,6 +82,52 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+def _parse_registered_layer_index(
+    layer_name: str,
+    start_layer: int,
+    end_layer: int,
+) -> int:
+    try:
+        layer_index = extract_layer_index(layer_name)
+    except AssertionError as exc:
+        raise ValueError(
+            "Unable to parse global layer index from KV cache layer name "
+            f"{layer_name!r}."
+        ) from exc
+
+    if layer_index < start_layer or layer_index >= end_layer:
+        raise ValueError(
+            "KV cache layer name "
+            f"{layer_name!r} parsed to global layer index {layer_index}, "
+            f"outside pipeline layer range [{start_layer}, {end_layer})."
+        )
+    return layer_index
+
+
+def _build_registered_layer_indices(
+    layer_names: list[str],
+    start_layer: int,
+    end_layer: int,
+) -> list[int]:
+    return [
+        _parse_registered_layer_index(layer_name, start_layer, end_layer)
+        for layer_name in layer_names
+    ]
+
+
+def _check_cross_layer_blocks_pp_supported(
+    cross_layers_blocks: bool,
+    pp_size: int,
+) -> None:
+    if cross_layers_blocks and pp_size > 1:
+        raise RuntimeError(
+            "cross-layer-blocks mode is not supported with "
+            "pipeline_parallel_size > 1 yet; set "
+            "kv_connector_extra_config.enable_cross_layers_blocks=False "
+            "or run with pp_size=1."
+        )
 
 
 class NixlConnectorWorker:
@@ -986,6 +1033,14 @@ class NixlConnectorWorker:
         )
 
         # After KV Caches registered, listen for new connections.
+        # ST-K commit 3 lifts these PP placeholders to real values from
+        # `get_pp_group()` and `extract_layer_index`; the schema fields are
+        # required-on-wire even though the values are placeholders here.
+        total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
+        num_regions = len(seen_base_addresses)
+        placeholder_layer_names = [
+            f"_placeholder_layer_{i}" for i in range(num_regions)
+        ]
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1002,6 +1057,12 @@ class NixlConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            pp_rank=0,
+            pp_size=1,
+            start_layer=0,
+            end_layer=total_num_hidden_layers,
+            registered_layer_indices=[0] * num_regions,
+            registered_layer_names=placeholder_layer_names,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None

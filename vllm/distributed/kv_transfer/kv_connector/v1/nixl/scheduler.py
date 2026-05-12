@@ -185,6 +185,7 @@ class NixlConnectorScheduler:
         host = params.get("remote_host")
         port = params.get("remote_port")
         tp_size = params.get("tp_size")
+        pp_size = params.get("pp_size", 1)
         if (
             remote_engine_id is None
             or remote_request_id is None
@@ -199,6 +200,7 @@ class NixlConnectorScheduler:
                 host=host,
                 port=port,
                 tp_size=tp_size,
+                pp_size=pp_size,
             )
         self._heartbeat_by_engine[remote_engine_id].req_ids.add(remote_request_id)
         self._heartbeat_req_engine[request.request_id] = (

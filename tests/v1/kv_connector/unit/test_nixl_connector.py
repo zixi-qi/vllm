@@ -556,6 +556,12 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     ssm_sizes=(0, 0),
                     attn_backend_name=self.backend_name,
                     physical_blocks_per_logical_kv_block=1,
+                pp_rank=0,
+                pp_size=1,
+                start_layer=0,
+                end_layer=1,
+                registered_layer_indices=[0],
+                registered_layer_names=["model.layers.0.self_attn"],
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
@@ -1009,6 +1015,12 @@ class TestNixlHandshake:
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
                 physical_blocks_per_logical_kv_block=1,
+            pp_rank=0,
+            pp_size=1,
+            start_layer=0,
+            end_layer=1,
+            registered_layer_indices=[0],
+            registered_layer_names=["model.layers.0.self_attn"],
             )
 
             with pytest.raises(RuntimeError):
@@ -1067,6 +1079,12 @@ class TestNixlHandshake:
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
                 physical_blocks_per_logical_kv_block=1,
+            pp_rank=0,
+            pp_size=1,
+            start_layer=0,
+            end_layer=1,
+            registered_layer_indices=[0],
+            registered_layer_names=["model.layers.0.self_attn"],
             )
 
             # We don't check layout for homogeneous TP and MLA for now, as the
@@ -2506,6 +2524,12 @@ def test_compatibility_hash_validation(
         ssm_sizes=(0, 0),
         attn_backend_name=decode_worker.backend_name,
         physical_blocks_per_logical_kv_block=1,
+    pp_rank=0,
+    pp_size=1,
+    start_layer=0,
+    end_layer=1,
+    registered_layer_indices=[0],
+    registered_layer_names=["model.layers.0.self_attn"],
     )
     handshake_payload = NixlHandshakePayload(
         compatibility_hash=remote_hash,
