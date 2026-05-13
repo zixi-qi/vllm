@@ -31,6 +31,9 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
 from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
@@ -505,7 +508,9 @@ class Worker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
-    def get_kv_connector_handshake_metadata(self) -> dict | None:
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
         """Get KV connector metadata from this worker if available."""
 
         if not has_kv_transfer_group():
@@ -517,8 +522,9 @@ class Worker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
+        pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()

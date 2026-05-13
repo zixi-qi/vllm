@@ -414,11 +414,9 @@ def test_kv_transfer_handshake(dist_init):
         decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
         expected_agent_metadata = decoder.decode(metadata.agent_metadata_bytes)
 
-        # The scheduler connector expects metadata to be in
-        # dict[int, KVConnectorHandshakeMetadata], where the first key is
-        # the dp_rank, the second key is the tp_rank.
+        # The scheduler connector expects metadata keyed by (pp_rank, tp_rank).
         scheduler_connector = scheduler.get_kv_connector()
-        scheduler_connector.set_xfer_handshake_metadata({0: metadata})
+        scheduler_connector.set_xfer_handshake_metadata({(0, 0): metadata})
 
         # Simulate a request that finishes prefill, which returns
         # corresponding NixlConnectorMetadata for decode instance.
@@ -458,6 +456,7 @@ def test_kv_transfer_handshake(dist_init):
                 kv_connector_metadata["remote_host"],
                 kv_connector_metadata["remote_port"],
                 kv_connector_metadata["tp_size"],
+                kv_connector_metadata.get(\"pp_size\", 1),
                 kv_connector_metadata["remote_engine_id"],
             )
 
@@ -508,8 +507,14 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         )
 
     def _nixl_handshake(
-        self, host: str, port: int, remote_tp_size: int, expected_engine_id: str
-    ) -> dict[int, str]:
+        self,
+        host: str,
+        port: int,
+        remote_tp_size: int,
+        remote_pp_size: int,
+        expected_engine_id: str,
+    ) -> dict[tuple[int, int], str]:
+        assert remote_pp_size == 1
         # Mimic slow _nixl_handshake, as well as bypass zmq communication.
         time.sleep(self._hand_shake_latency)
         # These should've been done in register_kv_caches(), called by
@@ -539,7 +544,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         # When remote tp_size > local tp_size, handshake with multiple
         # remote ranks.
         num_handshakes = 1 if tp_ratio > 0 else -tp_ratio
-        remote_agents: dict[int, str] = {}
+        remote_agents: dict[tuple[int, int], str] = {}
         for remote_tp_rank in range(num_handshakes):
             remote_agent_name = self.add_remote_agent(
                 NixlAgentMetadata(
@@ -566,7 +571,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
             )
-            remote_agents[remote_tp_rank] = remote_agent_name
+            remote_agents[(0, remote_tp_rank)] = remote_agent_name
         return remote_agents
 
 
@@ -607,7 +612,7 @@ class TestNixlHandshake:
         worker.nixl_wrapper.set_cycles_before_xfer_done(3)
         # simulate handshake
         worker.dst_xfer_side_handles = {
-            FakeNixlConnectorWorker.REMOTE_ENGINE_ID: {0: 1}
+            FakeNixlConnectorWorker.REMOTE_ENGINE_ID: {(0, 0): 1}
         }
         worker.kv_cache_layout = "HND"
         num_xfers = 4
@@ -783,6 +788,7 @@ class TestNixlHandshake:
             host="localhost",
             port=1234,
             remote_tp_size=4,
+            remote_pp_size=1,
             expected_engine_id=worker.REMOTE_ENGINE_ID,
         )
         check_handshake(4)
@@ -795,6 +801,7 @@ class TestNixlHandshake:
             host="localhost",
             port=1234,
             remote_tp_size=6,
+            remote_pp_size=1,
             expected_engine_id=worker.REMOTE_ENGINE_ID,
         )
         check_handshake(6)
@@ -1873,8 +1880,8 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
         worker.src_xfer_handles_by_block_size = {worker.block_size: 455}
         # P TP = 2 * D TP case, we should register 2 local handles
         worker.src_xfer_handles_by_tp_ratio = {-2: [456, 457]}
-        worker.dst_xfer_side_handles = {"engine1": {0: 789}}
-        worker._remote_agents = {"engine1": {0: "agent1"}}
+        worker.dst_xfer_side_handles = {"engine1": {(0, 0): 789}}
+        worker._remote_agents = {"engine1": {(0, 0): "agent1"}}
         worker._registered_descs = ["desc1", "desc2"]
 
         mock_listener.is_alive.return_value = False
@@ -2554,6 +2561,7 @@ def test_compatibility_hash_validation(
                     host="localhost",
                     port=1234,
                     remote_tp_size=1,
+                    remote_pp_size=1,
                     expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
                 )
         else:
@@ -2561,6 +2569,7 @@ def test_compatibility_hash_validation(
                 host="localhost",
                 port=1234,
                 remote_tp_size=1,
+                remote_pp_size=1,
                 expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             )
             # Verify handshake returned agent mapping
@@ -2653,6 +2662,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
                 host="localhost",
                 port=1234,
                 remote_tp_size=1,
+                remote_pp_size=1,
                 expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             )
 

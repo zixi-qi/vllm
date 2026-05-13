@@ -182,7 +182,7 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_scheduler.request_finished(request, block_ids)
 
     def set_xfer_handshake_metadata(
-        self, metadata: dict[int, KVConnectorHandshakeMetadata]
+        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
     ) -> None:
         """
         Set the KV connector handshake metadata for this connector.

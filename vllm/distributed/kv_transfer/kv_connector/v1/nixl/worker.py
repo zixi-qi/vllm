@@ -339,7 +339,9 @@ class NixlConnectorWorker:
 
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
-        self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
+        self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = (
+            defaultdict(dict)
+        )
 
         # Metadata.
         self.engine_id: EngineId = engine_id
@@ -451,7 +453,9 @@ class NixlConnectorWorker:
             thread_name_prefix="vllm-nixl-handshake-initiator",
         )
         self._ready_requests = queue.Queue[tuple[ReqId, ReqMeta]]()
-        self._handshake_futures: dict[EngineId, Future[dict[int, str]]] = {}
+        self._handshake_futures: dict[
+            EngineId, Future[dict[tuple[int, int], str]]
+        ] = {}
         # Protects _handshake_futures and _remote_agents.
         self._handshake_lock = threading.RLock()
 
@@ -522,9 +526,17 @@ class NixlConnectorWorker:
         host: str,
         port: int,
         remote_tp_size: int,
+        remote_pp_size: int,
         expected_engine_id: str,
-    ) -> dict[int, str]:
+    ) -> dict[tuple[int, int], str]:
         """Do a NIXL handshake with a remote instance."""
+        # TODO(consumer per-shard refactor): once `_remote_agents` is re-keyed by
+        # (pp_rank, tp_rank) and `add_remote_agent` is shard-aware, the assert
+        # below can drop and the loop can fan out across producer PP shards.
+        assert remote_pp_size == 1, (
+            "NIXL PP-sharded producers are not supported until remote agent "
+            "state is keyed by both PP rank and TP rank."
+        )
 
         # the first time we connect to a remote agent.
         # be careful, the handshake happens in a background thread.
@@ -545,95 +557,104 @@ class NixlConnectorWorker:
         # this happens to be the same single rank_i.
         assert self.transfer_topo is not None
         p_remote_ranks = self.transfer_topo.handshake_target_ranks(remote_tp_size)
-        remote_rank_to_agent_name = {}
+        remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
-            for remote_rank in p_remote_ranks:
-                logger.debug(
-                    "Querying metadata on path: %s at remote tp rank %s",
-                    path,
-                    remote_rank,
-                )
-
-                start_time = time.perf_counter()
-                # Send query for the request.
-                msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
-                # Set receive timeout to 5 seconds to avoid hanging on dead server
-                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
-                sock.send(msg)
-                handshake_bytes = sock.recv()
-
-                # Decode handshake payload to get compatibility hash
-                handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
-                try:
-                    handshake_payload = handshake_decoder.decode(handshake_bytes)
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
-                    raise RuntimeError(
-                        f"Failed to decode NixlHandshakePayload. This likely indicates "
-                        f"an incompatibility between connector version. Error: {e}"
-                    ) from e
-
-                got_metadata_time = time.perf_counter()
-                logger.debug(
-                    "NIXL handshake: get metadata took: %s",
-                    got_metadata_time - start_time,
-                )
-
-                # Check compatibility hash BEFORE decoding agent metadata
-                assert self.compat_hash is not None
-                if (
-                    self.enforce_compat_hash
-                    and handshake_payload.compatibility_hash != self.compat_hash
-                ):
-                    raise RuntimeError(
-                        f"NIXL compatibility hash mismatch. "
-                        f"Local: {self.compat_hash}, "
-                        f"Remote: {handshake_payload.compatibility_hash}. "
-                        f"Prefill and decode instances have incompatible "
-                        f"configurations. This may be due to: different vLLM versions,"
-                        f" models, dtypes, KV cache layouts, attention backends, etc. "
-                        f"Both instances must use identical configurations."
-                        f"Disable this check using "
-                        f'--kv-transfer-config \'{{"kv_connector_extra_config": '
-                        f'{{"enforce_handshake_compat": false}}}}\''
+            for remote_pp_rank in range(remote_pp_size):
+                for remote_rank in p_remote_ranks:
+                    logger.debug(
+                        "Querying metadata on path: %s at remote pp rank %s, "
+                        "tp rank %s",
+                        path,
+                        remote_pp_rank,
+                        remote_rank,
                     )
 
-                logger.info(
-                    "NIXL compatibility check passed (hash: %s)",
-                    handshake_payload.compatibility_hash,
-                )
-
-                # Decode agent metadata
-                metadata_decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-                try:
-                    metadata = metadata_decoder.decode(
-                        handshake_payload.agent_metadata_bytes
+                    start_time = time.perf_counter()
+                    # Send query for the request.
+                    msg = msgspec.msgpack.encode(
+                        (GET_META_MSG, remote_pp_rank, remote_rank)
                     )
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
-                    # This should not happen if hash matched
-                    raise RuntimeError(
-                        f"Failed to decode NixlAgentMetadata. Error: {e}"
-                    ) from e
+                    # Set receive timeout to 5 seconds to avoid hanging on dead server
+                    sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
+                    sock.send(msg)
+                    handshake_bytes = sock.recv()
 
-                # Ensure engine id matches.
-                if metadata.engine_id != expected_engine_id:
-                    raise RuntimeError(
-                        f"Remote NIXL agent engine ID mismatch. "
-                        f"Expected {expected_engine_id},"
-                        f"received {metadata.engine_id}."
+                    # Decode handshake payload to get compatibility hash
+                    handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
+                    try:
+                        handshake_payload = handshake_decoder.decode(handshake_bytes)
+                    except (msgspec.DecodeError, msgspec.ValidationError) as e:
+                        raise RuntimeError(
+                            "Failed to decode NixlHandshakePayload. This likely "
+                            "indicates an incompatibility between connector "
+                            f"version. Error: {e}"
+                        ) from e
+
+                    got_metadata_time = time.perf_counter()
+                    logger.debug(
+                        "NIXL handshake: get metadata took: %s",
+                        got_metadata_time - start_time,
                     )
 
-                # Register Remote agent.
-                remote_agent_name = self.add_remote_agent(
-                    metadata, remote_rank, remote_tp_size
-                )
-                setup_agent_time = time.perf_counter()
-                logger.debug(
-                    "NIXL handshake: add agent took: %s",
-                    setup_agent_time - got_metadata_time,
-                )
-                remote_rank_to_agent_name[remote_rank] = remote_agent_name
+                    # Check compatibility hash BEFORE decoding agent metadata
+                    assert self.compat_hash is not None
+                    if (
+                        self.enforce_compat_hash
+                        and handshake_payload.compatibility_hash != self.compat_hash
+                    ):
+                        raise RuntimeError(
+                            f"NIXL compatibility hash mismatch. "
+                            f"Local: {self.compat_hash}, "
+                            f"Remote: {handshake_payload.compatibility_hash}. "
+                            "Prefill and decode instances have incompatible "
+                            "configurations. This may be due to: different vLLM "
+                            "versions, models, dtypes, KV cache layouts, attention "
+                            "backends, etc. Both instances must use identical "
+                            "configurations. Disable this check using "
+                            "--kv-transfer-config "
+                            '\'{"kv_connector_extra_config": '
+                            '{"enforce_handshake_compat": false}}\''
+                        )
+
+                    logger.info(
+                        "NIXL compatibility check passed (hash: %s)",
+                        handshake_payload.compatibility_hash,
+                    )
+
+                    # Decode agent metadata
+                    metadata_decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+                    try:
+                        metadata = metadata_decoder.decode(
+                            handshake_payload.agent_metadata_bytes
+                        )
+                    except (msgspec.DecodeError, msgspec.ValidationError) as e:
+                        # This should not happen if hash matched
+                        raise RuntimeError(
+                            f"Failed to decode NixlAgentMetadata. Error: {e}"
+                        ) from e
+
+                    # Ensure engine id matches.
+                    if metadata.engine_id != expected_engine_id:
+                        raise RuntimeError(
+                            f"Remote NIXL agent engine ID mismatch. "
+                            f"Expected {expected_engine_id},"
+                            f"received {metadata.engine_id}."
+                        )
+
+                    # Register Remote agent.
+                    remote_agent_name = self.add_remote_agent(
+                        metadata, remote_rank, remote_tp_size
+                    )
+                    setup_agent_time = time.perf_counter()
+                    logger.debug(
+                        "NIXL handshake: add agent took: %s",
+                        setup_agent_time - got_metadata_time,
+                    )
+                    remote_rank_to_agent_name[(remote_pp_rank, remote_rank)] = (
+                        remote_agent_name
+                    )
         return remote_rank_to_agent_name
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -748,7 +769,8 @@ class NixlConnectorWorker:
         host: str,
         port: int,
         tp_size: int,
-    ) -> Future[dict[int, str]] | None:
+        pp_size: int,
+    ) -> Future[dict[tuple[int, int], str]] | None:
         """
         Ensure a handshake is in-flight (or already done) for *engine_id*.
 
@@ -769,11 +791,14 @@ class NixlConnectorWorker:
                 host,
                 port,
                 tp_size,
+                pp_size,
                 engine_id,
             )
             self._handshake_futures[engine_id] = fut
 
-            def done_callback(f: Future[dict[int, str]], eid=engine_id):
+            def done_callback(
+                f: Future[dict[tuple[int, int], str]], eid=engine_id
+            ):
                 with self._handshake_lock:
                     del self._handshake_futures[eid]
                     try:
@@ -799,6 +824,7 @@ class NixlConnectorWorker:
             meta.remote.host,
             meta.remote.port,
             meta.tp_size,
+            meta.pp_size,
         )
         if fut is None:
             # Already handshaked — only happens if caller does not pre-check.

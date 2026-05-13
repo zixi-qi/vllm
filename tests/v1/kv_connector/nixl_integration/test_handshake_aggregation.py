@@ -1,0 +1,202 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import threading
+from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import msgspec
+import pytest
+import zmq
+
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    GET_META_MSG,
+    NixlHandshakePayload,
+    RemoteMeta,
+    ReqMeta,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.scheduler import (
+    NixlConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+    NixlConnectorWorker,
+)
+
+
+class _InlineThread:
+    def __init__(
+        self,
+        *,
+        target: Callable[..., Any],
+        args: tuple[Any, ...],
+        **_: Any,
+    ) -> None:
+        self._target = target
+        self._args = args
+
+    def start(self) -> None:
+        self._target(*self._args)
+
+
+class _FakeZmqContext:
+    def __init__(self, sock: "_FakeHandshakeSocket") -> None:
+        self._sock = sock
+
+    def __enter__(self) -> "_FakeHandshakeSocket":
+        return self._sock
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+
+class _FakeHandshakeSocket:
+    def __init__(
+        self,
+        request_msg: bytes,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self._request_msg = request_msg
+        self._stop_event = stop_event
+        self._recv_count = 0
+        self.sent_multipart: list[tuple[bytes, bytes, bytes]] = []
+
+    def setsockopt(self, *_: Any) -> None:
+        return None
+
+    def recv_multipart(self) -> tuple[bytes, bytes, bytes]:
+        if self._recv_count == 0:
+            self._recv_count += 1
+            return (b"identity", b"", self._request_msg)
+        if self._stop_event is not None:
+            self._stop_event.set()
+        raise zmq.Again()
+
+    def send_multipart(self, parts: tuple[bytes, bytes, bytes]) -> None:
+        self.sent_multipart.append(parts)
+
+
+def test_engine_merge_preserves_pp_and_tp_keys():
+    metadata_a = object()
+    metadata_b = object()
+    metadata_c = object()
+    worker_dicts = [
+        {(0, 0): metadata_a},
+        {(1, 0): metadata_b},
+        {(0, 1): metadata_c},
+    ]
+
+    content: dict[tuple[int, int], object] = {}
+    for worker_dict in worker_dicts:
+        content.update(worker_dict)
+
+    assert content == {
+        (0, 0): metadata_a,
+        (1, 0): metadata_b,
+        (0, 1): metadata_c,
+    }
+
+
+def test_scheduler_listener_serves_three_tuple_key():
+    scheduler = NixlConnectorScheduler.__new__(NixlConnectorScheduler)
+    scheduler._nixl_handshake_listener_t = None
+    scheduler._stop_event = threading.Event()
+    scheduler.side_channel_host = "localhost"
+    scheduler.side_channel_port = 1234
+
+    payload = NixlHandshakePayload(
+        compatibility_hash="hash",
+        agent_metadata_bytes=b"agent",
+    )
+    request = msgspec.msgpack.encode((GET_META_MSG, 1, 0))
+    sock = _FakeHandshakeSocket(request, stop_event=scheduler._stop_event)
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.scheduler.zmq_ctx",
+            return_value=_FakeZmqContext(sock),
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.scheduler."
+            "threading.Thread",
+            _InlineThread,
+        ),
+    ):
+        scheduler.set_xfer_handshake_metadata({(1, 0): payload})
+
+    assert len(sock.sent_multipart) == 1
+    identity, delimiter, encoded_payload = sock.sent_multipart[0]
+    assert identity == b"identity"
+    assert delimiter == b""
+    decoded_payload = msgspec.msgpack.decode(
+        encoded_payload, type=NixlHandshakePayload
+    )
+    assert decoded_payload == payload
+
+
+def test_scheduler_listener_rejects_legacy_two_tuple_key():
+    stop_event = threading.Event()
+    request = msgspec.msgpack.encode((GET_META_MSG, 0))
+    sock = _FakeHandshakeSocket(request)
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.scheduler.zmq_ctx",
+        return_value=_FakeZmqContext(sock),
+    ):
+        with pytest.raises(ValueError, match="NIXL handshake requests must"):
+            NixlConnectorScheduler._nixl_handshake_listener(
+                {(0, 0): b"payload"},
+                threading.Event(),
+                stop_event,
+                "localhost",
+                1234,
+            )
+
+    assert sock.sent_multipart == []
+
+
+@pytest.mark.parametrize("pp_size", [1, 4])
+def test_background_nixl_handshake_submits_remote_pp_size(pp_size: int):
+    worker = NixlConnectorWorker.__new__(NixlConnectorWorker)
+    worker._handshake_futures = {}
+    worker._handshake_initiation_executor = MagicMock()
+    future = MagicMock()
+    worker._handshake_initiation_executor.submit.return_value = future
+    worker._handshake_lock = threading.Lock()
+    worker._remote_agents = {}
+    worker._ready_requests = MagicMock()
+    worker._log_failure = MagicMock()
+    worker._recving_transfers = {}
+    worker.src_xfer_handles_by_block_size = {}
+    worker.src_xfer_handles_by_tp_ratio = {}
+    worker.dst_xfer_side_handles = {}
+    worker._registered_descs = []
+
+    remote_engine_id = "remote-engine"
+    meta = ReqMeta(
+        local_block_ids=([0],),
+        local_physical_block_ids=([0],),
+        tp_size=2,
+        pp_size=pp_size,
+        remote=RemoteMeta(
+            block_ids=([1],),
+            host="localhost",
+            port=1234,
+            engine_id=remote_engine_id,
+            request_id="remote-request",
+        ),
+    )
+
+    worker._background_nixl_handshake("request", remote_engine_id, meta)
+
+    worker._handshake_initiation_executor.submit.assert_called_once_with(
+        worker._nixl_handshake,
+        "localhost",
+        1234,
+        2,
+        pp_size,
+        remote_engine_id,
+    )
+    assert future.add_done_callback.call_count == 2
