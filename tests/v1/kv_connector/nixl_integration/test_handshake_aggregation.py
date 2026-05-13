@@ -157,6 +157,35 @@ def test_scheduler_listener_rejects_legacy_two_tuple_key():
     assert sock.sent_multipart == []
 
 
+def test_ensure_handshake_treats_partial_pp_state_as_inflight():
+    worker = NixlConnectorWorker.__new__(NixlConnectorWorker)
+    future = MagicMock()
+    remote_engine_id = "remote-engine"
+    worker._handshake_lock = threading.RLock()
+    worker._handshake_futures = {remote_engine_id: future}
+    worker._remote_agents = {remote_engine_id: {(0, 0): "agent-0-0"}}
+    worker._pp_layer_map = {}
+
+    assert (
+        worker._ensure_handshake(remote_engine_id, "localhost", 1234, 1, 2)
+        is future
+    )
+
+
+def test_handshake_complete_requires_pp_layer_map():
+    worker = NixlConnectorWorker.__new__(NixlConnectorWorker)
+    remote_engine_id = "remote-engine"
+    worker._handshake_futures = {}
+    worker._remote_agents = {remote_engine_id: {(0, 0): "agent-0-0"}}
+    worker._pp_layer_map = {}
+
+    assert not worker._handshake_complete(remote_engine_id, 2)
+
+    worker._pp_layer_map[remote_engine_id] = SimpleNamespace(pp_size=2)
+
+    assert worker._handshake_complete(remote_engine_id, 2)
+
+
 @pytest.mark.parametrize("pp_size", [1, 4])
 def test_background_nixl_handshake_submits_remote_pp_size(pp_size: int):
     worker = NixlConnectorWorker.__new__(NixlConnectorWorker)
@@ -169,8 +198,8 @@ def test_background_nixl_handshake_submits_remote_pp_size(pp_size: int):
     worker._ready_requests = MagicMock()
     worker._log_failure = MagicMock()
     worker._recving_transfers = {}
-    worker.src_xfer_handles_by_block_size = {}
-    worker.src_xfer_handles_by_tp_ratio = {}
+    worker.src_xfer_handles_by_remote = {}
+    worker.src_xfer_handles_by_shard_tp_ratio = {}
     worker.dst_xfer_side_handles = {}
     worker._registered_descs = []
 
