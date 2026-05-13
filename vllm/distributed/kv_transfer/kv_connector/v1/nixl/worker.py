@@ -73,6 +73,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
@@ -877,6 +878,17 @@ class NixlConnectorWorker:
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config, self.backend_name, self.transfer_topo.cross_layers_blocks
         )
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        _check_cross_layer_blocks_pp_supported(
+            self.transfer_topo.cross_layers_blocks, pp_size
+        )
+        pp_rank = get_pp_group().rank_in_group
+        start_layer, end_layer = self.model_config.get_layers_start_end_indices(
+            self.vllm_config.parallel_config
+        )
+        total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
+        assert 0 <= pp_rank < pp_size
+        assert 0 < end_layer - start_layer <= total_num_hidden_layers
 
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
@@ -917,12 +929,17 @@ class NixlConnectorWorker:
         # Enable different block lengths for different layers *only* when MLA is used.
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
         self.block_len_per_layer = list[int]()
+        registered_layer_indices: list[int] = []
+        registered_layer_names: list[str] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
             # NOTE (NickLucche) Hybrid SSM models assume a layout that is similar to
             # that of FI, with block laid out as in `get_backend_aware_kv_block_len`.
             # However, physical page_size may differ when kernel requires a specific
             # block size. This leads to SSM and FA layers having different num_blocks.
             # `_physical_blocks_per_logical_kv_block` ratio is used to adjust for this.
+            layer_index = _parse_registered_layer_index(
+                layer_name, start_layer, end_layer
+            )
             layer_spec = self._layer_specs[layer_name]
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 # MLA DSv32 Indexer case: UniformTypeKVCacheSpecs merges kv_cache_specs
@@ -978,6 +995,8 @@ class NixlConnectorWorker:
                     )
                 else:
                     self.block_len_per_layer.append(physical_page_size)
+                registered_layer_indices.append(layer_index)
+                registered_layer_names.append(layer_name)
 
                 if cache.shape[0] != num_blocks:
                     raise AssertionError(
@@ -1011,7 +1030,12 @@ class NixlConnectorWorker:
         logger.debug(
             "Different block lengths collected: %s", set(self.block_len_per_layer)
         )
-        assert len(self.block_len_per_layer) == len(seen_base_addresses)
+        assert (
+            len(self.block_len_per_layer)
+            == len(seen_base_addresses)
+            == len(registered_layer_indices)
+            == len(registered_layer_names)
+        )
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
@@ -1059,14 +1083,16 @@ class NixlConnectorWorker:
         )
 
         # After KV Caches registered, listen for new connections.
-        # ST-K commit 3 lifts these PP placeholders to real values from
-        # `get_pp_group()` and `extract_layer_index`; the schema fields are
-        # required-on-wire even though the values are placeholders here.
-        total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
         num_regions = len(seen_base_addresses)
-        placeholder_layer_names = [
-            f"_placeholder_layer_{i}" for i in range(num_regions)
-        ]
+        logger.info(
+            "Registering KV_Caches. pp_rank=%d/%d, layers=[%d, %d), "
+            "registered_regions=%d",
+            pp_rank,
+            pp_size,
+            start_layer,
+            end_layer,
+            num_regions,
+        )
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1083,12 +1109,12 @@ class NixlConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
-            pp_rank=0,
-            pp_size=1,
-            start_layer=0,
-            end_layer=total_num_hidden_layers,
-            registered_layer_indices=[0] * num_regions,
-            registered_layer_names=placeholder_layer_names,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            registered_layer_indices=registered_layer_indices,
+            registered_layer_names=registered_layer_names,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
