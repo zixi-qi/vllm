@@ -17,6 +17,7 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
 instead of embedding feature-specific logic directly.
 """
 
+import copy
 import functools
 import gc
 import time
@@ -49,7 +50,12 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -1203,7 +1209,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_reqs, max_sample_len=self.num_speculative_steps + 1
             )
             self.postprocess(input_batch, sampled, num_sampled, num_rejected)
-            return None
+            # Return an empty ModelRunnerOutput carrying the local
+            # kv_connector_output so KVOutputAggregator.aggregate can
+            # count this rank's finished_sending / finished_recving ticks.
+            # Returning None drops the rank's per-request completion signal
+            # and trips the aggregator's non-None invariant.
+            if kv_connector_output is None or kv_connector_output.is_empty():
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+            output.kv_connector_output = kv_connector_output
+            return output
 
         # Last rank: sample tokens
         sampler_output, num_sampled, num_rejected = self.sample(
