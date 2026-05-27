@@ -3,6 +3,7 @@
 """Unit tests for NixlConnectorScheduler with HMA and Mamba N-1 prefill."""
 
 import gc
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -179,11 +180,12 @@ def test_read_blocks_for_req_expands_remote_ids(
     remote_info.remote_physical_blocks_per_logical = remote_physical_per_logical
     worker.transfer_topo.get_engine_info.return_value = remote_info
     worker.use_mla = False
+    worker._pp_layer_map = {remote_engine_id: SimpleNamespace(pp_size=1)}
 
     mock_plan = MagicMock(spec=TPMapping)
     mock_plan.all_source_ranks = ()
     mock_plan.source_ranks_per_group = ()
-    worker.tp_mappings = {remote_engine_id: mock_plan}
+    worker.tp_mappings = {(remote_engine_id, 0): mock_plan}
 
     metadata = NixlConnectorMetadata()
     metadata.add_new_req_to_recv(

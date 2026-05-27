@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
+    SupportsPP,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class NixlConnector(KVConnectorBase_V1, SupportsHMA):
+class NixlConnector(KVConnectorBase_V1, SupportsHMA, SupportsPP):
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         if any(
@@ -181,11 +182,15 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
-    def set_xfer_handshake_metadata(
-        self, metadata: dict[int, KVConnectorHandshakeMetadata]
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
     ) -> None:
         """
-        Set the KV connector handshake metadata for this connector.
+        Set the PP-aware KV connector handshake metadata for this connector.
+
+        Engine core hands NIXL the full ``{(pp_rank, tp_rank): metadata}``
+        dict. Non-PP unwrap for legacy connectors happens in engine core
+        before the dispatch, so NIXL never sees the int-keyed shape.
 
         Args:
             metadata (dict): the handshake metadata to set.
