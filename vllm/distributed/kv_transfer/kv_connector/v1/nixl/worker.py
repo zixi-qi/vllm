@@ -11,7 +11,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import msgspec
 import numpy as np
@@ -86,6 +86,31 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+_ShardDescLayout: TypeAlias = tuple[
+    int,  # num_blocks
+    tuple[int, ...],  # region_group_ids
+    int,  # physical_blocks_per_logical
+    int,  # mamba_region_count
+    tuple[int, ...],  # mamba_region_group_ids
+]
+
+
+def _make_shard_desc_layout(
+    num_blocks: int,
+    region_group_ids: tuple[int, ...],
+    *,
+    physical_blocks_per_logical: int = 1,
+    mamba_region_count: int = 0,
+    mamba_region_group_ids: tuple[int, ...] = (),
+) -> _ShardDescLayout:
+    return (
+        num_blocks,
+        region_group_ids,
+        physical_blocks_per_logical,
+        mamba_region_count,
+        mamba_region_group_ids,
+    )
 
 
 class NixlConnectorWorker:
@@ -381,6 +406,15 @@ class NixlConnectorWorker:
             EngineId, dict[tuple[int, int], list[int]]
         ](dict)
         self.local_seen_layer_names: list[str] = []
+        # Map every local layer name (including pool members that share a
+        # NIXL region with another layer) to the region indices its caches
+        # occupy. Needed because HMA pooling lets producer and consumer pick
+        # different "representative" layer names for the same shared region,
+        # so strict-name matching against ``local_seen_layer_names`` alone
+        # misses sharing-partner names.
+        self._local_layer_name_to_region_indices: dict[str, list[int]] = defaultdict(
+            list
+        )
         self._remote_agent_metadata: dict[
             EngineId, dict[tuple[int, int], NixlAgentMetadata]
         ] = defaultdict(dict)
@@ -403,11 +437,11 @@ class NixlConnectorWorker:
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[tuple[int, int], int]](
             dict
         )
-        # Per-shard descriptor layout: (num_blocks, region_group_ids)
+        # Per-shard descriptor layout: (num_blocks, region_group_ids,
+        # physical_blocks_per_logical, mamba_region_count,
+        # mamba_region_group_ids)
         # keyed by (engine_id, remote_pp_rank, "local" | "remote").
-        self._xfer_desc_layouts: dict[
-            tuple[EngineId, int, str], tuple[int, tuple[int, ...]]
-        ] = {}
+        self._xfer_desc_layouts: dict[tuple[EngineId, int, str], _ShardDescLayout] = {}
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -513,22 +547,27 @@ class NixlConnectorWorker:
     def _local_region_indices_for_layer_names(
         self, registered_layer_names: list[str]
     ) -> list[int]:
-        local_names = self.local_seen_layer_names
-        positions_by_name: dict[str, list[int]] = defaultdict(list)
-        for local_idx, layer_name in enumerate(local_names):
-            positions_by_name[layer_name].append(local_idx)
-
+        # ``_local_layer_name_to_region_indices`` covers every layer name
+        # present in the local kv_caches mapping — including pool members that
+        # were dedup'd out of ``local_seen_layer_names`` because they share a
+        # NIXL region with another (representative) layer. Strict matching on
+        # ``local_seen_layer_names`` would miss those names whenever the
+        # producer and consumer pick different pool representatives (e.g.
+        # producer's PP-rank-0 alone-SWA representative vs the full-model
+        # alone-SWA representative on the consumer).
+        mapping = self._local_layer_name_to_region_indices
         occurrences_by_name: dict[str, int] = defaultdict(int)
         local_indices: list[int] = []
         for layer_name in registered_layer_names:
             occurrence = occurrences_by_name[layer_name]
             occurrences_by_name[layer_name] += 1
-            matches = positions_by_name.get(layer_name, [])
+            matches = mapping.get(layer_name, [])
             if occurrence >= len(matches):
                 raise RuntimeError(
                     "NIXL handshake failed: producer registered layer "
                     f"{layer_name!r} occurrence {occurrence} has no matching "
-                    f"local region. Local registered layers: {local_names}"
+                    f"local region. Local registered layers: "
+                    f"{self.local_seen_layer_names}"
                 )
             local_indices.append(matches[occurrence])
         return local_indices
@@ -538,13 +577,28 @@ class NixlConnectorWorker:
     ) -> tuple[int, ...]:
         # Non-MLA split-K/V backends register K and V as separate regions
         # that share the same KV-group id, hence the x2 duplication.
-        group_ids = tuple(
-            self._layer_name_to_kv_group_index[name] for name in registered_layer_names
-        )
+        group_ids = self._kv_group_indices_for_layer_names(registered_layer_names)
         assert self.transfer_topo is not None
         if self.transfer_topo.is_kv_layout_blocks_first:
             return tuple(g for g in group_ids for _ in range(2))
         return group_ids
+
+    def _mamba_region_group_ids_for_layer_names(
+        self, registered_layer_names: list[str]
+    ) -> tuple[int, ...]:
+        group_ids = self._kv_group_indices_for_layer_names(registered_layer_names)
+        return tuple(g for g in group_ids for _ in range(4))
+
+    def _kv_group_indices_for_layer_names(
+        self, registered_layer_names: list[str]
+    ) -> tuple[int, ...]:
+        mapping = self._layer_name_to_kv_group_index
+        try:
+            return tuple(mapping[name] for name in registered_layer_names)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"KV cache layer {exc.args[0]!r} is not present in any kv_cache_group."
+            ) from exc
 
     def _try_update_pp_layer_map(
         self, engine_id: EngineId, remote_pp_size: int
@@ -953,15 +1007,6 @@ class NixlConnectorWorker:
                 "cross-layer-blocks mode is not supported with "
                 "pipeline_parallel_size > 1 yet."
             )
-        if self._has_mamba and pp_size > 1:
-            # Per-shard descriptor layouts for hybrid (Mamba/SSM) producers
-            # need mamba_region_count / mamba_region_group_ids tracking that
-            # the consumer descriptor builder does not yet implement. Follow-up
-            # PR adds this.
-            raise RuntimeError(
-                "Hybrid (Mamba/SSM) models are not yet supported with "
-                "pipeline_parallel_size > 1 over NIXL PD disaggregation."
-            )
         pp_rank = get_pp_group().rank_in_group
         start_layer, end_layer = self.model_config.get_layers_start_end_indices(
             self.vllm_config.parallel_config
@@ -1008,6 +1053,10 @@ class NixlConnectorWorker:
         self.block_len_per_layer = list[int]()
         seen_layer_indices: list[int] = []
         seen_layer_names: list[str] = []
+        # Reset before populating: register_kv_caches may run again after a
+        # sleep/wake cycle, and stale mappings would point at outdated regions.
+        self._local_layer_name_to_region_indices = defaultdict(list)
+        base_addr_to_region_idx: dict[int, int] = {}
         for layer_name, cache_or_caches in xfer_buffers.items():
             # NOTE (NickLucche) Hybrid SSM models assume a layout that is similar to
             # that of FI, with block laid out as in `get_backend_aware_kv_block_len`.
@@ -1052,16 +1101,22 @@ class NixlConnectorWorker:
             # registering a single tensor for both K/V and splitting logically like FI.
             for cache in cache_list:
                 base_addr = cache.data_ptr()
-                if base_addr in seen_base_addresses:
+                existing_region_idx = base_addr_to_region_idx.get(base_addr)
+                if existing_region_idx is not None:
                     # NOTE (NickLucche) HMA employs memory pooling to share tensors
                     # across groups. This results in skipping all tensors but the ones
                     # pointed to by group0. Also, generally we will have more blocks
                     # per tensor but fewer regions.
                     logger.debug("Skipping %s because it's already seen", layer_name)
+                    self._local_layer_name_to_region_indices[layer_name].append(
+                        existing_region_idx
+                    )
                     continue
                 logger.debug(
                     "Registering layer %s with cache shape: %s", layer_name, cache.shape
                 )
+                region_idx = len(seen_base_addresses)
+                base_addr_to_region_idx[base_addr] = region_idx
                 seen_base_addresses.append(base_addr)
                 # Only record non-Mamba page sizes.
                 if isinstance(layer_spec, MambaSpec):
@@ -1072,6 +1127,7 @@ class NixlConnectorWorker:
                     self.block_len_per_layer.append(physical_page_size)
                 seen_layer_indices.append(layer_index)
                 seen_layer_names.append(layer_name)
+                self._local_layer_name_to_region_indices[layer_name].append(region_idx)
 
                 if cache.shape[0] != num_blocks:
                     raise AssertionError(
@@ -1199,6 +1255,7 @@ class NixlConnectorWorker:
         self,
         base_addresses: list[int],
         block_size_ratio: int,
+        local_region_indices: list[int] | None = None,
     ) -> list[tuple[int, int, int]]:
         """Build 4 desc regions (x, B, C, ssm) per layer for local mamba
         blocks, enabling the 3-read transfer with DS conv layout."""
@@ -1213,7 +1270,9 @@ class NixlConnectorWorker:
         physical_per_logical = self._physical_blocks_per_logical_kv_block
 
         result: list[tuple[int, int, int]] = []
-        for i, base_addr in enumerate(base_addresses):
+        if local_region_indices is None:
+            local_region_indices = list(range(len(base_addresses)))
+        for i, base_addr in zip(local_region_indices, base_addresses):
             # Jump one page_size, but ssm page_size may be bigger when kernel
             # locks block size to a specific value (physical_per_logical scale).
             page_stride = (
@@ -1413,7 +1472,8 @@ class NixlConnectorWorker:
             self.device_id,
         )
         if self._has_mamba:
-            assert self.num_descs == len(blocks_data)
+            if registered_layer_names is None:
+                assert self.num_descs == len(blocks_data)
             # TODO (ZhanqiuHu): For homogeneous TP (tp_ratio == 1), the 3-descs split
             # is unnecessary — a single conv desc per block suffices.  Consider
             # adding a fast path that falls back to the standard 2-region
@@ -1422,7 +1482,9 @@ class NixlConnectorWorker:
             # because local descs are created before knowing the remote TP.
             logger.debug("Registering local Mamba descriptors (4 regions/layer)")
             blocks_data.extend(
-                self._build_mamba_local(local_base_addresses, block_size_ratio)
+                self._build_mamba_local(
+                    local_base_addresses, block_size_ratio, local_region_indices
+                )
             )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
@@ -1583,13 +1645,28 @@ class NixlConnectorWorker:
             self.src_xfer_handles_by_remote[local_handle_key] = handle
             self.src_blocks_data_by_remote[local_handle_key] = blocks_data
             self._xfer_desc_layouts[(engine_id, remote_pp_rank, "local")] = (
-                self.num_blocks * block_size_ratio,
-                self._region_group_ids_for_layer_names(
-                    nixl_agent_meta.registered_layer_names
-                ),
+                _make_shard_desc_layout(
+                    self.num_blocks * block_size_ratio,
+                    self._region_group_ids_for_layer_names(
+                        nixl_agent_meta.registered_layer_names
+                    ),
+                    physical_blocks_per_logical=(
+                        self._physical_blocks_per_logical_kv_block
+                    ),
+                    mamba_region_count=len(nixl_agent_meta.registered_layer_names) * 4
+                    if self._has_mamba
+                    else 0,
+                    mamba_region_group_ids=(
+                        self._mamba_region_group_ids_for_layer_names(
+                            nixl_agent_meta.registered_layer_names
+                        )
+                        if self._has_mamba
+                        else ()
+                    ),
+                )
             )
         src_blocks_data = self.src_blocks_data_by_remote[local_handle_key]
-        local_num_blocks, local_region_group_ids = self._xfer_desc_layouts[
+        local_num_blocks, local_region_group_ids, _, _, _ = self._xfer_desc_layouts[
             (engine_id, remote_pp_rank, "local")
         ]
         local_region_indices = self._local_region_indices_for_layer_names(
@@ -1662,10 +1739,23 @@ class NixlConnectorWorker:
         )
 
         self._xfer_desc_layouts[(engine_id, remote_pp_rank, "remote")] = (
-            nixl_agent_meta.num_blocks,
-            self._region_group_ids_for_layer_names(
-                nixl_agent_meta.registered_layer_names
-            ),
+            _make_shard_desc_layout(
+                nixl_agent_meta.num_blocks,
+                self._region_group_ids_for_layer_names(
+                    nixl_agent_meta.registered_layer_names
+                ),
+                physical_blocks_per_logical=physical_blocks_per_logical,
+                mamba_region_count=len(nixl_agent_meta.kv_caches_base_addr) * 4
+                if self._has_mamba
+                else 0,
+                mamba_region_group_ids=(
+                    self._mamba_region_group_ids_for_layer_names(
+                        nixl_agent_meta.registered_layer_names
+                    )
+                    if self._has_mamba
+                    else ()
+                ),
+            )
         )
         self._remote_agents[engine_id][shard_key] = remote_agent_name
 
@@ -1764,9 +1854,10 @@ class NixlConnectorWorker:
                     "Remote is HND and local is NHD, enabled additional permute "
                     "on local device KV."
                 )
-                assert not self._is_hma_required, (
-                    "HMA does not support block size post processing"
-                )
+                if self._is_hma_required:
+                    raise RuntimeError(
+                        "HMA does not support block size post processing"
+                    )
                 self.enable_permute_local_kv = True
             else:
                 raise RuntimeError(
@@ -2044,7 +2135,10 @@ class NixlConnectorWorker:
             if not self.use_mla and (
                 block_size_ratio > 1 or self.enable_permute_local_kv
             ):
-                assert not self._is_hma_required
+                if self._is_hma_required:
+                    raise RuntimeError(
+                        "HMA does not support block size post processing"
+                    )
                 block_ids_for_blocksize_post_process[block_size_ratio].append(
                     meta.local_physical_block_ids[0]
                 )
@@ -2444,30 +2538,28 @@ class NixlConnectorWorker:
             remote_info.remote_block_size
         )
         if block_size_ratio > 1:
-            # TODO (NickLucche) assume HMA is off. Change to handle multiple KV groups.
-            assert not self._is_hma_required
-            local_block_ids0 = local_block_ids[0] if local_block_ids else []
-            remote_block_ids0 = remote_block_ids[0]
-            local_block_ids_mapped = self.get_mapped_blocks(
-                np.asarray(local_block_ids0), block_size_ratio
-            ).tolist()
-            if len(local_block_ids_mapped) > len(remote_block_ids0):
-                # NOTE:
-                # get_mapped_blocks will always expand block_ids for n times.
-                # ex:
-                # prefill block_ids with block_size as 4:
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-                # Local decode block_ids with block_size as 16: [1, 2, 3]
-                # expanded decode block_ids with get_mapped_blocks from [1, 2, 3] to
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-                # Then we clip local to align with prefill
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] to
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-                local_block_ids_mapped = local_block_ids_mapped[
-                    : len(remote_block_ids0)
-                ]
-            local_block_ids = [local_block_ids_mapped] if local_block_ids_mapped else []
-            remote_block_ids = [remote_block_ids0]
+            local_block_ids_mapped_by_group: list[list[int]] = []
+            remote_block_ids_by_group: list[list[int]] = []
+            for group_idx, remote_group_ids in enumerate(remote_block_ids):
+                remote_group_ids = list(remote_group_ids)
+                local_group_ids = list(local_block_ids[group_idx])
+                if _is_ssm_spec(self._group_spec_types[group_idx]):
+                    local_block_ids_mapped = local_group_ids
+                else:
+                    local_block_ids_mapped = self.get_mapped_blocks(
+                        np.asarray(local_group_ids), block_size_ratio
+                    ).tolist()
+                    if len(local_block_ids_mapped) > len(remote_group_ids):
+                        # get_mapped_blocks expands each local block by
+                        # block_size_ratio. Clip padding to the producer's
+                        # actual remote block count.
+                        local_block_ids_mapped = local_block_ids_mapped[
+                            : len(remote_group_ids)
+                        ]
+                local_block_ids_mapped_by_group.append(local_block_ids_mapped)
+                remote_block_ids_by_group.append(remote_group_ids)
+            local_block_ids = local_block_ids_mapped_by_group
+            remote_block_ids = remote_block_ids_by_group
 
         # NOTE(rob): having the staging blocks be on the READER side is
         # not going to work well (since we will have to call rearrange tensors).
@@ -2574,18 +2666,53 @@ class NixlConnectorWorker:
         block_ids: BlockIds,
     ) -> np.ndarray:
         """Get descriptor IDs relative to a shard-local prepared dlist."""
-        num_blocks, region_group_ids = self._xfer_desc_layouts[
-            (engine_id, remote_pp_rank, side)
-        ]
+        (
+            num_blocks,
+            region_group_ids,
+            physical_blocks_per_logical,
+            mamba_region_count,
+            mamba_region_group_ids,
+        ) = self._xfer_desc_layouts[(engine_id, remote_pp_rank, side)]
+
         desc_ids = []
         for region_id, group_id in enumerate(region_group_ids):
-            group_arr = np.asarray(block_ids[group_id], dtype=np.int64)
-            if group_arr.size == 0:
+            if self._has_mamba and _is_ssm_spec(self._group_spec_types[group_id]):
                 continue
-            desc_ids.append(region_id * num_blocks + group_arr)
+            group_arr = np.asarray(block_ids[group_id], dtype=np.int64)
+            if group_arr.size > 0:
+                desc_ids.append(region_id * num_blocks + group_arr)
+
+        if self._has_mamba:
+            assert physical_blocks_per_logical > 0
+            assert num_blocks % physical_blocks_per_logical == 0, (
+                "Mamba descriptor layout num_blocks must be divisible by "
+                "physical_blocks_per_logical"
+            )
+            assert mamba_region_count > 0
+            assert len(mamba_region_group_ids) == mamba_region_count
+            logical_blocks = num_blocks // physical_blocks_per_logical
+            num_fa_descs = len(region_group_ids) * num_blocks
+            for region_id, group_id in enumerate(mamba_region_group_ids):
+                if not _is_ssm_spec(self._group_spec_types[group_id]):
+                    continue
+                group_arr = np.asarray(block_ids[group_id], dtype=np.int64)
+                if group_arr.size > 0:
+                    desc_ids.append(
+                        num_fa_descs + region_id * logical_blocks + group_arr
+                    )
+
         if not desc_ids:
             return np.empty(0, dtype=np.int64)
-        return np.concatenate(desc_ids)
+        desc_ids_arr = np.concatenate(desc_ids)
+        if self._has_mamba:
+            num_descs = len(region_group_ids) * num_blocks + mamba_region_count * (
+                num_blocks // physical_blocks_per_logical
+            )
+            assert int(desc_ids_arr.max()) < num_descs, (
+                "Mamba shard descriptor IDs must be relative to the shard-local "
+                "dlist layout"
+            )
+        return desc_ids_arr
 
     def get_mapped_blocks(
         self, block_ids: np.ndarray, block_size_ratio: int
