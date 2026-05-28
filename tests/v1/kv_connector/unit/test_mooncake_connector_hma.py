@@ -7,6 +7,7 @@ send trimming, and group-count invariant checking in _build_transfer_params.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeConnector,
     MooncakeConnectorMetadata,
     MooncakeConnectorScheduler,
+    MooncakeConnectorWorker,
     MooncakeXferMetadata,
     SendBlockMeta,
     TransferRegion,
@@ -291,6 +293,184 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
         assert len(lengths) == len(src_ptrs)
 
         worker.shutdown()
+
+
+@pytest.mark.asyncio
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
+    ".mooncake_connector.TransferEngine",
+    FakeMooncakeWrapper,
+)
+async def test_build_transfer_params_hma_per_region_group_routing(monkeypatch):
+    """HMA regions use their own KV-cache-group block lists at pp_size=1."""
+
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+    kv_cache_config = make_kv_cache_config(
+        block_size=vllm_config.cache_config.block_size, swa_enabled=True
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        connector = MooncakeConnector(
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
+        )
+        worker = connector.connector_worker
+
+        block_len = 64
+        transfer_id = "xfer-hma-route"
+        send_meta = SendBlockMeta(
+            p_req_id="p-route",
+            transfer_id=transfer_id,
+            local_block_ids=[[1, 2], [101, 102]],
+            ready=asyncio.Event(),
+        )
+        xfer_meta = MooncakeXferMetadata(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={"d-route": (transfer_id, [[11, 12], [201, 202]])},
+            kv_caches_base_addr=[0x3000, 0x4000],
+            block_lens=[block_len, block_len],
+            registered_layer_names=["layer0", "layer1"],
+            registered_layer_group_ids=[0, 1],
+        )
+        local_regions = [
+            TransferRegion(0x1000, block_len, block_len, group_id=0),
+            TransferRegion(0x2000, block_len, block_len, group_id=1),
+        ]
+        remote_regions = [
+            TransferRegion(0x3000, block_len, block_len, group_id=0),
+            TransferRegion(0x4000, block_len, block_len, group_id=1),
+        ]
+
+        (
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+            err_reqs,
+            err_msg,
+        ) = await worker._build_transfer_params(
+            [("d-route", send_meta)],
+            xfer_meta,
+            local_regions,
+            remote_regions,
+        )
+
+        assert err_reqs == []
+        assert err_msg is None
+        assert src_ptrs == [
+            0x1000 + 1 * block_len,
+            0x2000 + 101 * block_len,
+        ]
+        assert dst_ptrs == [
+            0x3000 + 11 * block_len,
+            0x4000 + 201 * block_len,
+        ]
+        assert lengths == [2 * block_len, 2 * block_len]
+
+        worker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_build_transfer_params_pp_asymmetric_hma_region_matching():
+    """DSv4-style producer PP shard maps into the consumer's global HMA pools."""
+
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.transfer_topo = SimpleNamespace(
+        is_kv_layout_blocks_first=False,
+        local_replicates_kv_cache=False,
+    )
+
+    block_len = 64
+    worker.registered_layer_names = [
+        "layers.2.attn",
+        "layers.3.attn",
+        "layers.2.swa",
+    ]
+    worker.registered_layer_group_ids = [0, 0, 1]
+    local_regions_all = [
+        TransferRegion(0xA000, block_len, block_len, group_id=0),
+        TransferRegion(0xA000, block_len, block_len, group_id=0),
+        TransferRegion(0xB000, block_len, block_len, group_id=1),
+    ]
+    remote_regions_all = [
+        TransferRegion(0xC000, block_len, block_len, group_id=0),
+        TransferRegion(0xC000, block_len, block_len, group_id=0),
+        TransferRegion(0xC000, block_len, block_len, group_id=0),
+        TransferRegion(0xC000, block_len, block_len, group_id=0),
+        TransferRegion(0xD000, block_len, block_len, group_id=1),
+        TransferRegion(0xD000, block_len, block_len, group_id=1),
+    ]
+    transfer_id = "xfer-pp-hma"
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={"d-pp-hma": (transfer_id, [[20, 21], [60, 61]])},
+        kv_caches_base_addr=[],
+        block_lens=[],
+        registered_layer_names=[
+            "layers.0.attn",
+            "layers.1.attn",
+            "layers.2.attn",
+            "layers.3.attn",
+            "layers.0.swa",
+            "layers.2.swa",
+        ],
+        registered_layer_group_ids=[0, 0, 0, 0, 1, 1],
+    )
+
+    match_err, local_regions, remote_regions = worker._match_regions_by_name(
+        xfer_meta,
+        local_regions_all,
+        remote_regions_all,
+    )
+    assert match_err is None
+    assert local_regions == local_regions_all
+    assert remote_regions[0] is remote_regions_all[2]
+    assert remote_regions[1] is remote_regions_all[3]
+    assert remote_regions[2] is remote_regions_all[5]
+
+    send_meta = SendBlockMeta(
+        p_req_id="p-pp-hma",
+        transfer_id=transfer_id,
+        local_block_ids=[[10, 11], [50, 51]],
+        ready=asyncio.Event(),
+    )
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        [("d-pp-hma", send_meta)],
+        xfer_meta,
+        local_regions,
+        remote_regions,
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    assert src_ptrs == [
+        0xA000 + 10 * block_len,
+        0xA000 + 10 * block_len,
+        0xB000 + 50 * block_len,
+    ]
+    assert dst_ptrs == [
+        0xC000 + 20 * block_len,
+        0xC000 + 20 * block_len,
+        0xD000 + 60 * block_len,
+    ]
+    assert lengths == [2 * block_len, 2 * block_len, 2 * block_len]
 
 
 # ---------------------------------------------------------------------------
