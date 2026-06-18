@@ -1074,3 +1074,39 @@ def test_nixl_agent_metadata_has_member_fields():
     )
     assert meta2.registered_layer_names == []
     assert meta2.region_members == []
+
+
+def test_register_kv_caches_records_pooled_members():
+    """Guard for the per-region member bookkeeping register_kv_caches performs:
+    a pooled member (same base addr as an earlier region) is recorded against
+    that region instead of being dropped."""
+    region_members: list[list[str]] = []
+    base_to_region: dict[int, int] = {}
+
+    def add_layer(layer_name: str, base_addr: int):
+        existing = base_to_region.get(base_addr)
+        if existing is not None:
+            region_members[existing].append(layer_name)
+            return
+        idx = len(region_members)
+        base_to_region[base_addr] = idx
+        region_members.append([layer_name])
+
+    add_layer("layerA.attn", 0x1000)
+    add_layer("layerB.attn", 0x2000)
+    add_layer("layerA.attn.swa_cache", 0x1000)  # pooled onto region 0
+
+    member_to_region: dict[str, int] = {}
+    for r, members in enumerate(region_members):
+        for m in members:
+            member_to_region.setdefault(m, r)
+
+    assert region_members == [
+        ["layerA.attn", "layerA.attn.swa_cache"],
+        ["layerB.attn"],
+    ]
+    assert member_to_region == {
+        "layerA.attn": 0,
+        "layerA.attn.swa_cache": 0,
+        "layerB.attn": 1,
+    }

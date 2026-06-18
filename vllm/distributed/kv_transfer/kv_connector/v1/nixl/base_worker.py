@@ -511,6 +511,12 @@ class NixlBaseConnectorWorker:
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
         self.block_len_per_layer = list[int]()
 
+        # HMA fields advertised in the handshake (filled in register_kv_caches):
+        # region_members[i] = all layers sharing region i (incl. pooled members),
+        # _registered_layer_names = one representative per region.
+        self.region_members: list[list[str]] = []
+        self._registered_layer_names: list[str] = []
+
         # Per-engine TP mappings. Generated during handshake.
         self.tp_mappings: dict[EngineId, TPMapping] = {}
 
@@ -934,6 +940,11 @@ class NixlBaseConnectorWorker:
         # With hybrid allocator, layers can share a kv cache tensor
         seen_base_addresses = []
 
+        # Per-registration HMA bookkeeping: base address -> the region it first
+        # defined; region_members accumulates every layer pooled into each region.
+        base_addr_to_region_idx: dict[int, int] = {}
+        region_members: list[list[str]] = []
+
         # Note(tms): I modified this from the original region setup code.
         # K and V are now in different regions. Advantage is that we can
         # elegantly support MLA and any cases where the K and V tensors
@@ -992,16 +1003,26 @@ class NixlBaseConnectorWorker:
             # registering a single tensor for both K/V and splitting logically like FI.
             for cache in cache_list:
                 base_addr = cache.data_ptr()
-                if base_addr in seen_base_addresses:
+                existing_region_idx = base_addr_to_region_idx.get(base_addr)
+                if existing_region_idx is not None:
                     # NOTE (NickLucche) HMA employs memory pooling to share tensors
                     # across groups. This results in skipping all tensors but the ones
                     # pointed to by group0. Also, generally we will have more blocks
-                    # per tensor but fewer regions.
-                    logger.debug("Skipping %s because it's already seen", layer_name)
+                    # per tensor but fewer regions. Record the pooled member so
+                    # its blocks are still transferred.
+                    logger.debug(
+                        "Pooled member %s shares region %d",
+                        layer_name,
+                        existing_region_idx,
+                    )
+                    region_members[existing_region_idx].append(layer_name)
                     continue
                 logger.debug(
                     "Registering layer %s with cache shape: %s", layer_name, cache.shape
                 )
+                region_idx = len(seen_base_addresses)
+                base_addr_to_region_idx[base_addr] = region_idx
+                region_members.append([layer_name])
                 seen_base_addresses.append(base_addr)
                 # Only record non-Mamba page sizes.
                 if isinstance(layer_spec, MambaSpec):
@@ -1056,6 +1077,10 @@ class NixlBaseConnectorWorker:
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
+
+        # Publish the handshake fields: region members + a representative each.
+        self.region_members = region_members
+        self._registered_layer_names = [members[0] for members in region_members]
 
         if self.pp_size > 1:
             start_layer, end_layer = self.model_config.get_layers_start_end_indices(
@@ -1130,6 +1155,8 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            registered_layer_names=self._registered_layer_names,
+            region_members=self.region_members,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
