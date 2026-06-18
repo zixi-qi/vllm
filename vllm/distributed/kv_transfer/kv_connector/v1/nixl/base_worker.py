@@ -1008,7 +1008,7 @@ class NixlBaseConnectorWorker:
 
         caches_data = []
         # With hybrid allocator, layers can share a kv cache tensor
-        seen_base_addresses = []
+        seen_base_addresses: list[int] = []
 
         # Per-registration HMA bookkeeping: base address -> the region it first
         # defined; region_members accumulates every layer pooled into each region.

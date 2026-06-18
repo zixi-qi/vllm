@@ -1216,5 +1216,6 @@ class TestPushHmaMemberIdentity:
             block_size_ratio=None,
             physical_blocks_per_logical=1,
         )
-        # 2 regions x flattened blocks [1,2,5]: region0 -> [1,2,5], region1 -> [11,12,15].
+        # 2 regions x flattened blocks [1,2,5]:
+        # region0 -> [1,2,5], region1 -> [11,12,15].
         assert list(descs) == [1, 2, 5, 11, 12, 15]
