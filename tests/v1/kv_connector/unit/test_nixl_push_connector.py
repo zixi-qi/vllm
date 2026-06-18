@@ -328,6 +328,9 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
         w._recving_transfers = defaultdict(list)
+        # HMA member-identity routing state (set during the P->D handshake).
+        w._member_groups = {}
+        w._member_src_handles = {}
         w._reqs_to_process = set()
         w._reqs_to_send = {}
         w.consumer_notification_counts_by_req = defaultdict(int)
@@ -1183,3 +1186,35 @@ class TestPushHmaMemberIdentity:
         w.transfer_topo = MagicMock()
         w.transfer_topo.is_kv_layout_blocks_first = False
         assert w._use_member_identity(self._meta(region_members=[])) is False
+
+    def test_compute_desc_ids_per_member_groups(self):
+        """Each member (region) k uses its own kv-group's blocks, member-major."""
+        w = _StubWriterWorker.fresh()
+        w.num_regions = 3
+        w.block_len_per_layer = [8, 8, 8]
+        w._has_mamba = False
+        # group0 blocks=[1,2], group1 blocks=[5]; members map to groups (0,0,1).
+        descs = w._compute_desc_ids(
+            block_ids=[[1, 2], [5]],
+            dst_num_blocks=10,
+            block_size_ratio=None,
+            physical_blocks_per_logical=1,
+            region_group_ids=(0, 0, 1),
+        )
+        # region0: 0*10+[1,2]; region1: 1*10+[1,2]; region2: 2*10+[5].
+        assert list(descs) == [1, 2, 11, 12, 25]
+
+    def test_compute_desc_ids_unchanged_without_region_group_ids(self):
+        """Non-member path keeps the flatten-all-groups fast path."""
+        w = _StubWriterWorker.fresh()
+        w.num_regions = 2
+        w.block_len_per_layer = [8, 8]
+        w._has_mamba = False
+        descs = w._compute_desc_ids(
+            block_ids=[[1, 2], [5]],
+            dst_num_blocks=10,
+            block_size_ratio=None,
+            physical_blocks_per_logical=1,
+        )
+        # 2 regions x flattened blocks [1,2,5]: region0 -> [1,2,5], region1 -> [11,12,15].
+        assert list(descs) == [1, 2, 5, 11, 12, 15]

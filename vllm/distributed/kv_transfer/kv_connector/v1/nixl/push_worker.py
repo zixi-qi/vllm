@@ -508,6 +508,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
+        # HMA member-identity (set during the P->D handshake): member-ordered
+        # handle covering every pooled member. None on the non-HMA path.
+        member_groups = self._member_groups.get(engine_id)
 
         # Expand D's logical IDs using the ratio learned during the
         # NIXL handshake. ``meta`` is freshly built by
@@ -564,7 +567,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_size,
                 req_id,
             )
-            if tp_ratio < 0 and not self.use_mla:
+            if member_groups is not None:
+                local_xfer_side_handle = self._member_src_handles[engine_id]
+            elif tp_ratio < 0 and not self.use_mla:
                 assert remote_block_size == self.block_size
                 local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
             else:
@@ -583,6 +588,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                region_group_ids=member_groups,
             )
             if handle is not None:
                 handles.append(handle)
@@ -602,6 +608,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        region_group_ids: tuple[int, ...] | None = None,
     ) -> int | None:
         """Post a WRITE point-to-point xfer request.
 
@@ -654,12 +661,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
+            region_group_ids=region_group_ids,
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+            region_group_ids=region_group_ids,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
