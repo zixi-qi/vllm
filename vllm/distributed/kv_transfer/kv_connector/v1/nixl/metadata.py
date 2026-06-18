@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Metadata dataclasses and helpers for the NIXL connector."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -39,8 +39,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   2: Add remote_request_id to kv_transfer_params
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
+#   5: Add registered_layer_names + region_members for HMA member routing
 #
-NIXL_CONNECTOR_VERSION: int = 4
+NIXL_CONNECTOR_VERSION: int = 5
 
 
 @dataclass
@@ -56,6 +57,12 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    # Representative layer name per NIXL region, in region order.
+    registered_layer_names: list[str] = field(default_factory=list)
+    # Per region, all layer names sharing it, including HMA pooled members
+    # dedup'd out of registered_layer_names, so the producer can route every
+    # member's blocks by name (member-identity routing).
+    region_members: list[list[str]] = field(default_factory=list)
 
 
 @dataclass

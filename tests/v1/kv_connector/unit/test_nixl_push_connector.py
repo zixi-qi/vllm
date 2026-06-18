@@ -1032,3 +1032,45 @@ class TestPushWriterMlaReplication:
         # All of the request's WRITE handles must be tracked together, so the
         # engine thread never sees a partial set and double-frees the request.
         assert sorted(w._sending_transfers["p-req"]) == [1000, 1001]
+
+
+def test_nixl_agent_metadata_has_member_fields():
+    """HMA: NixlAgentMetadata advertises per-region representative layer names
+    and the full pooled-member list, at wire version 5."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NIXL_CONNECTOR_VERSION,
+    )
+
+    assert NIXL_CONNECTOR_VERSION == 5
+    meta = NixlAgentMetadata(
+        engine_id="e",
+        agent_metadata=b"",
+        kv_caches_base_addr=[0x1000, 0x2000],
+        device_id=0,
+        num_blocks=4,
+        block_lens=[128, 128],
+        kv_cache_layout="HND",
+        block_size=16,
+        ssm_sizes=(0, 0),
+        attn_backend_name="FLASH_ATTN",
+        physical_blocks_per_logical_kv_block=1,
+        registered_layer_names=["l0.attn", "l1.attn"],
+        region_members=[["l0.attn"], ["l1.attn", "l0.attn.swa_cache"]],
+    )
+    assert meta.region_members[1] == ["l1.attn", "l0.attn.swa_cache"]
+    # Back-compat default for constructions that omit the new fields.
+    meta2 = NixlAgentMetadata(
+        engine_id="e",
+        agent_metadata=b"",
+        kv_caches_base_addr=[],
+        device_id=0,
+        num_blocks=0,
+        block_lens=[],
+        kv_cache_layout="HND",
+        block_size=16,
+        ssm_sizes=(0, 0),
+        attn_backend_name="x",
+        physical_blocks_per_logical_kv_block=1,
+    )
+    assert meta2.registered_layer_names == []
+    assert meta2.region_members == []
