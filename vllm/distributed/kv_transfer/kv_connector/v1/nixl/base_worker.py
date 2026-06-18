@@ -247,13 +247,15 @@ class NixlBaseConnectorWorker:
         """Whether to route this remote's regions by pooled-member identity.
 
         Resolves each producer member to the local region holding it by name —
-        robust to HMA pool-representative divergence under PP. Applies on the
+        robust to HMA pool-representative divergence (and non-uniform
+        regions-per-layer) under PP. Applies only to hybrid (HMA) models on the
         plain (non-blocks-first, non-mamba) path for v5 producers that advertise
-        region_members; blocks-first and mamba keep the contiguous/legacy path.
+        region_members. Non-HMA keeps the proven contiguous region slice.
         """
         assert self.transfer_topo is not None
         return (
-            not self.transfer_topo.is_kv_layout_blocks_first
+            self._is_hma_required
+            and not self.transfer_topo.is_kv_layout_blocks_first
             and not self._has_mamba
             and bool(nixl_agent_meta.region_members)
         )
@@ -1163,7 +1165,11 @@ class NixlBaseConnectorWorker:
             for member in members:
                 self._member_to_local_region.setdefault(member, region_idx)
 
-        if self.pp_size > 1:
+        if self.pp_size > 1 and not self._is_hma_required:
+            # Contiguous region slice (non-HMA): regions are uniform per layer,
+            # so this PP stage's window into the full-model remote is a single
+            # offset. HMA models route by member identity instead (regions are
+            # pooled/non-uniform), so the offset is neither valid nor needed.
             start_layer, end_layer = self.model_config.get_layers_start_end_indices(
                 self.vllm_config.parallel_config
             )

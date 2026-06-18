@@ -329,6 +329,8 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._recving_metadata = {}
         w._recving_transfers = defaultdict(list)
         # HMA member-identity routing state (set during the P->D handshake).
+        # Default non-HMA: the contiguous-slice path; HMA tests override.
+        w._is_hma_required = False
         w._member_groups = {}
         w._member_src_handles = {}
         w._reqs_to_process = set()
@@ -1142,6 +1144,7 @@ class TestPushHmaMemberIdentity:
     def test_expand_remote_members_routes_by_name(self):
         w = _StubWriterWorker.fresh()
         w._has_mamba = False
+        w._is_hma_required = True
         w._member_to_local_region = {
             "layerA.attn": 0,
             "layerA.attn.swa_cache": 0,
@@ -1183,9 +1186,20 @@ class TestPushHmaMemberIdentity:
     def test_use_member_identity_false_without_region_members(self):
         w = _StubWriterWorker.fresh()
         w._has_mamba = False
+        w._is_hma_required = True
         w.transfer_topo = MagicMock()
         w.transfer_topo.is_kv_layout_blocks_first = False
         assert w._use_member_identity(self._meta(region_members=[])) is False
+
+    def test_use_member_identity_false_for_non_hma(self):
+        """Non-HMA models keep the proven contiguous region slice, not member
+        identity, even though region_members is populated for every model."""
+        w = _StubWriterWorker.fresh()
+        w._has_mamba = False
+        w._is_hma_required = False
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.is_kv_layout_blocks_first = False
+        assert w._use_member_identity(self._meta()) is False
 
     def test_compute_desc_ids_per_member_groups(self):
         """Each member (region) k uses its own kv-group's blocks, member-major."""
