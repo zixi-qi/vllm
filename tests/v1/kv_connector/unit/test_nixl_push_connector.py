@@ -1110,3 +1110,76 @@ def test_register_kv_caches_records_pooled_members():
         "layerA.attn.swa_cache": 0,
         "layerB.attn": 1,
     }
+
+
+class TestPushHmaMemberIdentity:
+    """HMA member-identity routing: producer members map to consumer regions by
+    layer name, one transfer unit per pooled member."""
+
+    @staticmethod
+    def _meta(**overrides):
+        base = dict(
+            engine_id="p-engine",
+            agent_metadata=b"a",
+            kv_caches_base_addr=[0xA000, 0xB000],
+            device_id=0,
+            num_blocks=4,
+            block_lens=[128, 128],
+            kv_cache_layout="HND",
+            block_size=16,
+            ssm_sizes=(0, 0),
+            attn_backend_name="FLASH_ATTN",
+            physical_blocks_per_logical_kv_block=1,
+            registered_layer_names=["layerA.attn", "layerB.attn"],
+            region_members=[["layerA.attn", "layerA.attn.swa_cache"], ["layerB.attn"]],
+        )
+        base.update(overrides)
+        return NixlAgentMetadata(**base)
+
+    def test_expand_remote_members_routes_by_name(self):
+        w = _StubWriterWorker.fresh()
+        w._has_mamba = False
+        w._member_to_local_region = {
+            "layerA.attn": 0,
+            "layerA.attn.swa_cache": 0,
+            "layerB.attn": 1,
+        }
+        w._layer_name_to_kv_group_index = {
+            "layerA.attn": 0,
+            "layerA.attn.swa_cache": 1,
+            "layerB.attn": 0,
+        }
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.is_kv_layout_blocks_first = False
+
+        meta = self._meta()
+        assert w._use_member_identity(meta) is True
+        local_regions, groups, member_meta = w._expand_remote_members(meta)
+        # 3 members across 2 producer regions, in region order.
+        assert local_regions == [0, 0, 1]
+        assert groups == (0, 1, 0)
+        # Each member repeats its producer region's base/len.
+        assert member_meta.kv_caches_base_addr == [0xA000, 0xA000, 0xB000]
+        assert member_meta.block_lens == [128, 128, 128]
+
+    def test_member_identity_skips_unowned_members(self):
+        """A PP stage that owns only some members writes only those."""
+        w = _StubWriterWorker.fresh()
+        w._has_mamba = False
+        # This stage owns only layerB.attn.
+        w._member_to_local_region = {"layerB.attn": 0}
+        w._layer_name_to_kv_group_index = {"layerB.attn": 0}
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.is_kv_layout_blocks_first = False
+
+        local_regions, groups, member_meta = w._expand_remote_members(self._meta())
+        assert local_regions == [0]
+        assert groups == (0,)
+        assert member_meta.kv_caches_base_addr == [0xB000]
+
+    def test_use_member_identity_false_without_region_members(self):
+        w = _StubWriterWorker.fresh()
+        w._has_mamba = False
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.is_kv_layout_blocks_first = False
+        assert w._use_member_identity(self._meta(region_members=[])) is False

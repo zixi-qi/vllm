@@ -12,6 +12,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
@@ -230,6 +231,57 @@ class NixlBaseConnectorWorker:
         block_len_per_layer without register_kv_caches).
         """
         return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
+
+    def _use_member_identity(self, nixl_agent_meta: NixlAgentMetadata) -> bool:
+        """Whether to route this remote's regions by pooled-member identity.
+
+        Resolves each producer member to the local region holding it by name —
+        robust to HMA pool-representative divergence under PP. Applies on the
+        plain (non-blocks-first, non-mamba) path for v5 producers that advertise
+        region_members; blocks-first and mamba keep the contiguous/legacy path.
+        """
+        assert self.transfer_topo is not None
+        return (
+            not self.transfer_topo.is_kv_layout_blocks_first
+            and not self._has_mamba
+            and bool(nixl_agent_meta.region_members)
+        )
+
+    def _expand_remote_members(
+        self, nixl_agent_meta: NixlAgentMetadata
+    ) -> tuple[list[int], tuple[int, ...], NixlAgentMetadata]:
+        """Expand a producer's region_members into one transfer unit per member.
+
+        Returns (member_local_regions, member_groups, member_meta):
+          - member_local_regions[k]: local NIXL region holding the k-th member,
+            resolved by layer name.
+          - member_groups[k]: that member's kv-group id.
+          - member_meta: nixl_agent_meta with kv_caches_base_addr/block_lens
+            expanded to one entry per member (repeating the producer region the
+            member lives in) so the region-indexed builders emit one descriptor
+            group per member.
+        Members this (PP-sharded) worker does not own are skipped.
+        """
+        member_local_regions: list[int] = []
+        member_groups: list[int] = []
+        member_remote_base: list[int] = []
+        member_block_lens: list[int] = []
+        for r, members in enumerate(nixl_agent_meta.region_members):
+            for layer_name in members:
+                local_region = self._member_to_local_region.get(layer_name)
+                if local_region is None:
+                    # Owned by another PP stage; this stage does not write it.
+                    continue
+                member_local_regions.append(local_region)
+                member_groups.append(self._layer_name_to_kv_group_index[layer_name])
+                member_remote_base.append(nixl_agent_meta.kv_caches_base_addr[r])
+                member_block_lens.append(nixl_agent_meta.block_lens[r])
+        member_meta = replace(
+            nixl_agent_meta,
+            kv_caches_base_addr=member_remote_base,
+            block_lens=member_block_lens,
+        )
+        return member_local_regions, tuple(member_groups), member_meta
 
     def __init__(
         self,
@@ -516,6 +568,9 @@ class NixlBaseConnectorWorker:
         # _registered_layer_names = one representative per region.
         self.region_members: list[list[str]] = []
         self._registered_layer_names: list[str] = []
+        # Producer-side member routing, built in register_kv_caches.
+        self._member_to_local_region: dict[str, int] = {}
+        self._layer_name_to_kv_group_index: dict[str, int] = {}
 
         # Per-engine TP mappings. Generated during handshake.
         self.tp_mappings: dict[EngineId, TPMapping] = {}
@@ -944,6 +999,12 @@ class NixlBaseConnectorWorker:
         # defined; region_members accumulates every layer pooled into each region.
         base_addr_to_region_idx: dict[int, int] = {}
         region_members: list[list[str]] = []
+        # Map every layer to its kv-cache-group index for per-member routing.
+        self._layer_name_to_kv_group_index = {
+            layer: g
+            for g, grp in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer in grp.layer_names
+        }
 
         # Note(tms): I modified this from the original region setup code.
         # K and V are now in different regions. Advantage is that we can
@@ -1081,6 +1142,11 @@ class NixlBaseConnectorWorker:
         # Publish the handshake fields: region members + a representative each.
         self.region_members = region_members
         self._registered_layer_names = [members[0] for members in region_members]
+        # Invert region_members: layer name -> the local region holding it.
+        self._member_to_local_region = {}
+        for region_idx, members in enumerate(region_members):
+            for member in members:
+                self._member_to_local_region.setdefault(member, region_idx)
 
         if self.pp_size > 1:
             start_layer, end_layer = self.model_config.get_layers_start_end_indices(
