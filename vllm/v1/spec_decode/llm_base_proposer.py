@@ -411,19 +411,18 @@ class SpecDecodeBaseProposer:
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for the drafter.
 
-        Only supports PIECEWISE cudagraphs (via mixed_mode).
+        The drafter only uses PIECEWISE cudagraphs, enabled whenever the
+        base model uses cudagraphs.
         This should be called after adjust_cudagraph_sizes_for_spec_decode.
         """
         if (
             not self.speculative_config.enforce_eager
-            and cudagraph_mode.mixed_mode()
-            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+            and cudagraph_mode != CUDAGraphMode.NONE
         ):
-            eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
+            draft_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
-            eagle_cudagraph_mode = CUDAGraphMode.NONE
-
-        self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
+            draft_cudagraph_mode = CUDAGraphMode.NONE
+        self.cudagraph_dispatcher.initialize_cudagraph_keys(draft_cudagraph_mode)
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""

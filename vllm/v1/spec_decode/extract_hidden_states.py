@@ -246,19 +246,18 @@ class ExtractHiddenStatesProposer:
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys.
 
-        Only supports PIECEWISE cudagraphs (via mixed_mode).
+        The drafter only uses PIECEWISE cudagraphs, enabled whenever the
+        base model uses cudagraphs.
         Should be called after adjust_cudagraph_sizes_for_spec_decode.
         """
         assert self.vllm_config.speculative_config is not None
         if (
             not self.vllm_config.speculative_config.enforce_eager
-            and cudagraph_mode.mixed_mode()
-            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+            and cudagraph_mode != CUDAGraphMode.NONE
         ):
             proposer_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
             proposer_cudagraph_mode = CUDAGraphMode.NONE
-
         self.cudagraph_dispatcher.initialize_cudagraph_keys(proposer_cudagraph_mode)
 
     @torch.inference_mode()

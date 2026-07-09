@@ -5996,19 +5996,19 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 assert self.speculative_config is not None
-                # Eagle currently only supports PIECEWISE cudagraphs.
-                # Therefore only use cudagraphs if the main model uses PIECEWISE
-                # NOTE(lucas): this is a hack, need to clean up.
-                use_cudagraphs = (
-                    (
-                        is_graph_capturing
-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-                    )
-                    or (
-                        not is_graph_capturing
-                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
-                    )
-                ) and not self.speculative_config.enforce_eager
+                # The drafter captures PIECEWISE cudagraphs in its own capture
+                # pass, driven by the drafter dispatcher keys. During base-model
+                # capture, keep this dummy drafter run eager so the base
+                # descriptor does not decide which draft shapes are captured.
+                base_cudagraph_mode = self.compilation_config.cudagraph_mode
+                draft_use_cudagraphs = (
+                    not self.speculative_config.enforce_eager
+                    and base_cudagraph_mode != CUDAGraphMode.NONE
+                )
+                use_cudagraphs = draft_use_cudagraphs and (
+                    not is_graph_capturing
+                    and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                )
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
@@ -6464,17 +6464,19 @@ class GPUModelRunner(
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+        draft_capture_descs = self._get_drafter_cudagraph_capture_descs()
         # Use a temporary manager for memory profiling. The persistent manager
         # is initialized later so it does not keep profiling-only graph state.
         encoder_cudagraph_manager = self._create_encoder_cudagraph_manager()
 
         decoder_graphs = sum(len(descs) for _, descs in capture_descs)
+        draft_graphs = sum(len(descs) for _, descs in draft_capture_descs)
         encoder_graphs = (
             encoder_cudagraph_manager.get_num_graphs_to_capture()
             if encoder_cudagraph_manager is not None
             else 0
         )
-        total_graphs = decoder_graphs + encoder_graphs
+        total_graphs = decoder_graphs + draft_graphs + encoder_graphs
         if total_graphs == 0:
             logger.debug("No CUDA graphs will be captured, skipping profiling")
             self._cleanup_profiling_kv_cache()
@@ -6484,6 +6486,11 @@ class GPUModelRunner(
             *(
                 f"{mode.name}={len(descs)} (largest={descs[0].num_tokens})"
                 for mode, descs in capture_descs
+                if descs
+            ),
+            *(
+                f"DRAFT_{mode.name}={len(descs)} (largest={descs[0].num_tokens})"
+                for mode, descs in draft_capture_descs
                 if descs
             ),
         ]
@@ -6508,6 +6515,7 @@ class GPUModelRunner(
 
         shared_memory_estimate = {}
         per_graph_estimate = {}
+        draft_memory_estimate = 0
         encoder_memory_estimate = 0
 
         # Cleanup-only guard: CUDA graph capture errors should still propagate
@@ -6558,6 +6566,21 @@ class GPUModelRunner(
                         per_graph / (1 << 20),
                     )
 
+                if draft_graphs > 0:
+                    mem_before = torch.accelerator.get_memory_info()[0]
+                    num_captured = self._capture_drafter_cudagraphs(
+                        draft_capture_descs
+                    )
+                    torch.accelerator.synchronize()
+                    free_after = torch.accelerator.get_memory_info()[0]
+                    draft_memory_estimate = max(mem_before - free_after, 0)
+
+                    logger.debug(
+                        "Estimated draft CUDA graph memory: %.2f MiB for %d graphs",
+                        draft_memory_estimate / (1 << 20),
+                        num_captured,
+                    )
+
                 if encoder_cudagraph_manager is not None:
                     mem_before = torch.accelerator.get_memory_info()[0]
                     encoder_cudagraph_manager.capture(graph_pool=encoder_profiling_pool)
@@ -6597,7 +6620,9 @@ class GPUModelRunner(
         )
         # Encoder graphs use a manager-local pool at runtime, separate from the
         # decoder pool, so add their estimate instead of overlaying it.
-        total_estimate = decoder_estimate + encoder_memory_estimate
+        total_estimate = (
+            decoder_estimate + draft_memory_estimate + encoder_memory_estimate
+        )
         logger.info(
             "Estimated CUDA graph memory: %.2f GiB total",
             total_estimate / (1 << 30),
@@ -6639,6 +6664,9 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=runtime_mode,
                 )
                 torch.accelerator.synchronize()
+
+            self._capture_drafter_cudagraphs()
+            torch.accelerator.synchronize()
 
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
@@ -6707,6 +6735,77 @@ class GPUModelRunner(
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
         )
+
+    def _get_drafter_cudagraph_capture_descs(
+        self,
+    ) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
+        drafter = getattr(self, "drafter", None)
+        if (
+            drafter is None
+            or self.speculative_config is None
+            or self.speculative_config.enforce_eager
+            or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        ):
+            return []
+
+        if not isinstance(getattr(drafter, "model", None), BreakableCUDAGraphWrapper):
+            return []
+
+        cudagraph_dispatcher = getattr(drafter, "cudagraph_dispatcher", None)
+        if cudagraph_dispatcher is None:
+            return []
+        return cudagraph_dispatcher.get_capture_descs()
+
+    def _capture_drafter_cudagraphs(
+        self,
+        capture_descs: list[tuple[CUDAGraphMode, list[BatchDescriptor]]] | None = None,
+    ) -> int:
+        drafter = getattr(self, "drafter", None)
+        if drafter is None or not hasattr(drafter, "dummy_run"):
+            return 0
+
+        if capture_descs is None:
+            capture_descs = self._get_drafter_cudagraph_capture_descs()
+        if not capture_descs:
+            return 0
+
+        model = getattr(drafter, "model", None)
+        assert isinstance(model, BreakableCUDAGraphWrapper)
+
+        num_warmups = self.compilation_config.cudagraph_num_of_warmups
+        num_captured = 0
+        for runtime_mode, batch_descs in capture_descs:
+            assert runtime_mode != CUDAGraphMode.NONE
+            if is_global_first_rank():
+                batch_descs = tqdm(
+                    batch_descs,
+                    disable=not self.load_config.use_tqdm_on_load,
+                    desc=f"Capturing CUDA graphs (draft, {runtime_mode.name})",
+                )
+            for batch_desc in batch_descs:
+                entry = model.entries.get(batch_desc)
+                if entry is not None and entry.capture is not None:
+                    continue
+
+                slot_mappings = None
+                if hasattr(drafter, "_get_slot_mapping"):
+                    slot_mappings = drafter._get_slot_mapping(batch_desc.num_tokens)
+                for _ in range(num_warmups):
+                    drafter.dummy_run(
+                        batch_desc.num_tokens,
+                        use_cudagraphs=False,
+                        slot_mappings=slot_mappings,
+                    )
+                drafter.dummy_run(
+                    batch_desc.num_tokens,
+                    use_cudagraphs=True,
+                    is_graph_capturing=True,
+                    slot_mappings=slot_mappings,
+                )
+                torch.accelerator.synchronize()
+                num_captured += 1
+
+        return num_captured
 
     def _capture_cudagraphs(
         self,
