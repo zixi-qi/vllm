@@ -270,14 +270,15 @@ class NixlBaseConnectorWorker:
     def _requires_member_identity(self) -> bool:
         """Whether this worker's local layout must be routed by layer name.
 
-        True for a push producer whose local KV layout is hybrid (HMA):
-        region indices are not a stable identity across the P/D layer split,
-        so transfers must be keyed by member name. Independent of the remote
-        peer.
+        True for a PP-sharded push producer whose local KV layout is hybrid
+        (HMA) or packed: region indices are not a stable identity across the
+        P/D layer split, so transfers must be keyed by member name. Independent
+        of the remote peer.
         """
         return (
             self._supports_member_identity
-            and self._is_hma_required
+            and self.pp_size > 1
+            and (self._is_hma_required or bool(self._packed_layer_info))
             and not self._has_mamba
         )
 
@@ -295,21 +296,28 @@ class NixlBaseConnectorWorker:
             return False
         if not nixl_agent_meta.region_members:
             raise RuntimeError(
-                "Local hybrid KV layout requires member-identity routing, but "
-                "the remote peer advertised no member metadata (region_members "
-                "is empty). The peer is likely running an incompatible connector "
-                "or configuration; refusing to fall back to region-index routing."
+                "Local hybrid/packed KV layout requires member-identity "
+                "routing, but the remote peer advertised no member metadata "
+                "(region_members is empty). The peer is likely running an "
+                "incompatible connector or configuration; refusing to fall "
+                "back to region-index routing."
             )
         return True
 
     def _expand_remote_members(
         self, nixl_agent_meta: NixlAgentMetadata
     ) -> tuple[NixlAgentMetadata, MemberTransferPlan]:
-        return plan_member_transfer(
+        member_meta, member_plan = plan_member_transfer(
             nixl_agent_meta,
             self.region_members,
             self._layer_name_to_kv_group_index,
+            local_packed_layouts=self._packed_layer_info,
+            local_block_stride=self._packed_block_stride,
         )
+        if member_plan.is_packed:
+            for layer_name in member_plan.member_names:
+                self._assert_packed_member_supported(layer_name)
+        return member_meta, member_plan
 
     def _check_member_plan_consistency(
         self, engine_id: EngineId, member_plan: MemberTransferPlan
@@ -349,6 +357,23 @@ class NixlBaseConnectorWorker:
             handle=handle,
             plan=member_plan,
         )
+
+    def _assert_packed_member_supported(self, layer_name: str) -> None:
+        """Reject non-MLA members on the packed member-major slicing path.
+
+        Pull and PP=1 push use the whole-region packed path. PP-sharded push
+        routes packed caches by member identity; per-member slicing of a packed
+        block currently assumes REPLICATE (MLA) members, so the restriction
+        lives here rather than in the shared ``_register_packed_kv_cache``.
+        """
+        spec = self._layer_specs.get(layer_name)
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.kv_cache_specs[layer_name]
+        if not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+            raise NotImplementedError(
+                "Packed member-major KV transfer currently supports only MLA "
+                f"caches; layer {layer_name!r} is not MLA"
+            )
 
     def __init__(
         self,
@@ -663,13 +688,17 @@ class NixlBaseConnectorWorker:
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
         self.block_len_per_layer = list[int]()
 
-        # Member metadata is populated for HMA layouts.
+        # Member metadata is populated for HMA and packed layouts.
         self.region_members = []
         self._layer_name_to_kv_group_index = {
             layer: group_idx
             for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups)
             for layer in group.layer_names
         }
+        # layer name -> (offset within a packed block, bytes per block).
+        self._packed_block_stride: int = 0
+        self._packed_layer_info: dict[str, tuple[int, int]] = {}
+
         # Per-engine TP mappings. Generated during handshake.
         self.tp_mappings: dict[EngineId, TPMapping] = {}
 
@@ -1075,12 +1104,12 @@ class NixlBaseConnectorWorker:
     def _register_packed_kv_cache(
         self,
         storage: torch.UntypedStorage,
+        kv_caches: dict[str, torch.Tensor],
     ) -> None:
         """Register a packed KV cache as a single NIXL region.
 
-        The packed allocation interleaves all layers per block, so each
-        block_stride-byte chunk is one logical block.  We register 1
-        NIXL region and create 1 descriptor per block.
+        Each block-stride chunk contains one slice per member. Member offsets
+        let a PP stage address only the layers it owns.
         """
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
@@ -1100,10 +1129,29 @@ class NixlBaseConnectorWorker:
         )
 
         total_size = storage.nbytes()
+        assert total_size % self.num_blocks == 0
         block_stride = total_size // self.num_blocks
         base_addr = storage.data_ptr()
         device_id = storage.device.index
         assert device_id is not None
+
+        self._packed_block_stride = block_stride
+        member_layouts: dict[str, tuple[int, int]] = {}
+        for layer_name, cache in kv_caches.items():
+            assert cache.shape[0] == self.num_blocks
+            assert cache.stride(0) * cache.element_size() == block_stride
+            member_offset = cache.data_ptr() - base_addr
+            page_size = (cache.numel() // cache.shape[0]) * cache.element_size()
+            assert member_offset >= 0 and member_offset + page_size <= block_stride, (
+                f"packed member {layer_name} offset={member_offset} "
+                f"page_size={page_size} escapes block_stride={block_stride}"
+            )
+            member_layouts[layer_name] = (member_offset, page_size)
+        # Registration is spec-agnostic (it only records byte offsets). Pull and
+        # PP=1 push transfer packed caches whole-region. PP-sharded push routes
+        # by member identity, which is MLA-only (enforced in
+        # _expand_remote_members); non-MLA packed PP push is rejected there.
+        self._packed_layer_info = member_layouts
 
         logger.info(
             "Registering packed KV cache: total_size=%s, block_stride=%s, "
@@ -1120,6 +1168,9 @@ class NixlBaseConnectorWorker:
         self.num_regions = 1
         self.num_descs = self.num_blocks
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [base_addr]
+
+        self._region_is_mla = [True]
+        self._set_region_members([list(member_layouts)])
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
@@ -1147,6 +1198,9 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            region_members=self.region_members,
+            packed_block_stride=block_stride,
+            packed_member_layouts=member_layouts,
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
@@ -1155,20 +1209,36 @@ class NixlBaseConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
+    def _get_packed_kv_cache_storage(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> torch.UntypedStorage | None:
+        """Return the shared storage when the KV cache config is packed."""
+        block_strides = {
+            tensor.block_stride for tensor in self.kv_cache_config.kv_cache_tensors
+        }
+        if not block_strides or block_strides == {0}:
+            return None
+        if 0 in block_strides or len(block_strides) != 1:
+            raise RuntimeError(
+                "Packed KV cache tensors must use one nonzero block stride"
+            )
+
+        storages = [cache.untyped_storage() for cache in kv_caches.values()]
+        storage_ptrs = {storage.data_ptr() for storage in storages}
+        if len(storage_ptrs) != 1:
+            raise RuntimeError("Packed KV cache tensors must share one storage")
+        return storages[0]
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
-        # Detect packed allocation: all tensors are strided views into the
-        # same backing storage (different data_ptr but same storage).
-        # This happens with DSv4-style contiguous per-block packing.
-        if len(kv_caches) > 1 and not self._has_mamba:
-            storage = next(iter(kv_caches.values())).untyped_storage()
-            storage_ptrs = {
-                cache.untyped_storage().data_ptr() for cache in kv_caches.values()
-            }
-            data_ptrs = {cache.data_ptr() for cache in kv_caches.values()}
-            if len(storage_ptrs) == 1 and len(data_ptrs) > 1:
-                self._register_packed_kv_cache(storage)
+        # Packed allocation is an explicit KVCacheConfig contract. Runtime
+        # strides can equal an unpacked page size, and unpacked pages can be
+        # padded, so they cannot reliably identify the allocation layout.
+        if not self._has_mamba:
+            storage = self._get_packed_kv_cache_storage(kv_caches)
+            if storage is not None:
+                self._register_packed_kv_cache(storage, kv_caches)
                 self.device_kv_caches = kv_caches
                 return
 
@@ -1513,6 +1583,22 @@ class NixlBaseConnectorWorker:
         assert self.transfer_topo is not None
         num_blocks = self.num_blocks * block_size_ratio
         result: list[tuple[int, int, int]] = []
+        if member_plan is not None and member_plan.is_packed:
+            if block_size_ratio != 1:
+                raise RuntimeError("Packed NIXL KV transfer requires equal block sizes")
+            base_addr = base_addresses[0]
+            stride = member_plan.local_block_stride
+            return [
+                (base_addr + off + block_id * stride, page, self.device_id)
+                for off, page in member_plan.local_layouts
+                for block_id in range(num_blocks)
+            ]
+        if self._packed_layer_info and member_plan is None:
+            stride = self.block_len_per_layer[0] // block_size_ratio
+            return [
+                (base_addresses[0] + b * stride, stride, self.device_id)
+                for b in range(num_blocks)
+            ]
         if member_plan is None:
             region_iter = list(enumerate(base_addresses))
         else:
@@ -1543,6 +1629,20 @@ class NixlBaseConnectorWorker:
         """Build remote FA descriptors, optionally in member order."""
         assert self.transfer_topo is not None
         result: list[tuple[int, int, int]] = []
+        if member_plan is not None and member_plan.is_packed:
+            if block_size_ratio != 1:
+                raise RuntimeError("Packed NIXL KV transfer requires equal block sizes")
+            num_blocks = nixl_agent_meta.num_blocks
+            stride = member_plan.remote_block_stride
+            device_id = nixl_agent_meta.device_id
+            return [
+                (base_addr + block_id * stride, page, device_id)
+                for base_addr, page in zip(
+                    nixl_agent_meta.kv_caches_base_addr,
+                    nixl_agent_meta.block_lens,
+                )
+                for block_id in range(num_blocks)
+            ]
         fa_group_idx = next(
             i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
         )
@@ -1961,7 +2061,9 @@ class NixlBaseConnectorWorker:
         # replication caps per-rank heads at 1 when tp > total_kv_heads
         # (issue #45330). Mamba uses the ssm_sizes counterpart, so skip here.
         if not self._has_mamba:
-            if member_plan is not None:
+            if member_plan is not None and member_plan.is_packed:
+                local_lens = [page_size for _, page_size in member_plan.local_layouts]
+            elif member_plan is not None:
                 local_lens = [
                     self.block_len_per_layer[region]
                     for region in member_plan.local_regions

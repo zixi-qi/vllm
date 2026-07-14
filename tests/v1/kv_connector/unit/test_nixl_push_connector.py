@@ -335,14 +335,18 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._recving_metadata = {}
         w._recving_transfers = defaultdict(list)
         w._is_hma_required = False
+        w._packed_block_stride = 0
+        w._packed_layer_info = {}
         w._member_xfer_state = {}
         w._reqs_to_process = set()
         w._reqs_to_send = {}
         w.consumer_notification_counts_by_req = defaultdict(int)
         w.tp_rank = 0
         w.world_size = 1
+        w.pp_size = 1
         w.engine_id = "test-decode-engine"
         w._remote_agents = {}
+        w._engine_clock_offset = {}
 
         # Track _do_start_push_kv invocations.
         calls: list[tuple[str, Any, dict[str, Any]]] = []
@@ -1004,9 +1008,6 @@ def _agent_metadata(
     region_members: list[list[str]],
     base_addresses: list[int],
     block_lens: list[int],
-    *,
-    packed_block_stride: int = 0,
-    packed_member_layouts: dict[str, tuple[int, int]] | None = None,
 ) -> NixlAgentMetadata:
     return NixlAgentMetadata(
         engine_id="remote-engine",
@@ -1021,8 +1022,6 @@ def _agent_metadata(
         attn_backend_name="FLASH_ATTN",
         physical_blocks_per_logical_kv_block=1,
         region_members=region_members,
-        packed_block_stride=packed_block_stride,
-        packed_member_layouts=packed_member_layouts or {},
     )
 
 
@@ -1031,6 +1030,7 @@ def _member_worker(
     group_by_member: dict[str, int],
 ) -> _StubWriterWorker:
     worker = _StubWriterWorker.fresh()
+    worker.pp_size = 2
     worker._has_mamba = False
     worker._is_hma_required = True
     worker._layer_name_to_kv_group_index = group_by_member
@@ -1061,15 +1061,21 @@ def test_member_identity_gate_preserves_the_non_hma_path():
     # A bare base worker (pull) never requires member routing.
     assert not object.__new__(NixlBaseConnectorWorker)._use_member_identity(metadata)
 
+    worker._is_hma_required = False
+    assert not worker._use_member_identity(metadata)
+
+    worker._packed_layer_info = {"a": (0, 128)}
+    assert worker._use_member_identity(metadata)
+
     # Local layout requires routing but the remote omitted member metadata:
     # fail loud instead of silently falling back to region-index routing.
     metadata.region_members = []
     with pytest.raises(RuntimeError, match="requires member-identity routing"):
         worker._use_member_identity(metadata)
 
-    # A non-HMA local layout does not require member routing.
-    worker._is_hma_required = False
-    metadata.region_members = [["a"]]
+    # PP=1 has congruent local/remote regions and keeps the legacy route even
+    # when its allocator is hybrid.
+    worker.pp_size = 1
     assert not worker._use_member_identity(metadata)
 
 

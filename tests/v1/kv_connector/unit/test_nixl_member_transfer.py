@@ -128,3 +128,61 @@ def test_plan_member_transfer_is_canonical_across_remote_orderings():
 def test_validate_region_members_rejects_duplicate_local_member():
     with pytest.raises(RuntimeError, match="spans multiple NIXL regions"):
         validate_region_members([["a"], ["a"]])
+
+
+def test_plan_packed_member_transfer_keeps_local_and_remote_strides():
+    remote = _metadata(
+        [["L0", "L1"]],
+        [0x10000],
+        [256],
+        packed_block_stride=256,
+        packed_member_layouts={"L0": (0, 128), "L1": (128, 128)},
+    )
+
+    prepared, plan = plan_member_transfer(
+        remote,
+        [["L1"]],
+        {"L1": 0},
+        local_packed_layouts={"L1": (0, 128)},
+        local_block_stride=128,
+    )
+
+    assert prepared.kv_caches_base_addr == [0x10080]
+    assert prepared.block_lens == [128]
+    assert prepared.packed_block_stride == 0
+    assert prepared.packed_member_layouts == {}
+    assert plan.member_names == ("L1",)
+    assert plan.local_layouts == ((0, 128),)
+    assert plan.local_block_stride == 128
+    assert plan.remote_block_stride == 256
+    assert plan.is_packed
+
+
+@pytest.mark.parametrize(
+    ("local_packed", "remote_packed"),
+    [(True, False), (False, True)],
+)
+def test_plan_member_transfer_rejects_mixed_packed_layouts(
+    local_packed: bool,
+    remote_packed: bool,
+):
+    remote = (
+        _metadata(
+            [["L0"]],
+            [0x10000],
+            [128],
+            packed_block_stride=128,
+            packed_member_layouts={"L0": (0, 128)},
+        )
+        if remote_packed
+        else _metadata([["L0"]], [0x10000], [128])
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be mixed"):
+        plan_member_transfer(
+            remote,
+            [["L0"]],
+            {"L0": 0},
+            local_packed_layouts={"L0": (0, 128)} if local_packed else None,
+            local_block_stride=128 if local_packed else 0,
+        )
