@@ -150,45 +150,34 @@ The CUDA Graphs wrapper no longer manages the warm-up logic. The warm-up process
 
 ## CUDA Graphs Compatibility of Attention Backends
 
-To signal the CUDA Graphs compatibility of the attention backends, we introduce a new enum type [AttentionCGSupport][vllm.v1.attention.backend.AttentionCGSupport], which is an enum type that tracks the capability of the attention backend to support CUDA Graphs. The value is sorted in the order of the capability, i.e., `ALWAYS`> `UNIFORM_BATCH`> `UNIFORM_SINGLE_TOKEN_DECODE`> `NEVER`.
+[AttentionCGSupport][vllm.v1.attention.backend.AttentionCGSupport] describes independent full-graph execution paths. Each field is a maximum query length **per request**: `0` disables that path, and `None` imposes no query-length limit. These limits are separate from context length and the total-token CUDA graph capture sizes.
 
 ```python
-class AttentionCGSupport(enum.Enum):
-    """ Constants for the CUDA Graphs support of the attention backend
-    Here we do not consider the cascade attention, as currently
-    it is never CUDA Graphs supported."""
+# Example: fixed-width decode through 32 queries per request,
+# variable-length decode through 16, and no mixed-batch graphs.
+support = AttentionCGSupport(uniform_decode=32, varlen_decode=16)
 
-    ALWAYS = 3
-    """CUDA Graphs always supported; supports mixed-prefill-decode"""
-    UNIFORM_BATCH = 2
-    """CUDA Graphs supported for batches that only contain query lengths that are
-    the same, this can be used for spec-decode 
-        i.e. "decodes" are 1 + num_speculative_tokens"""
-    UNIFORM_SINGLE_TOKEN_DECODE = 1
-    """CUDA Graphs supported for batches that only contain query_len==1 decodes"""
-    NEVER = 0
-    """NO CUDA Graphs support"""
+assert support.supports_uniform_decode(32)
+assert support.supports_varlen_decode(8)
+assert not support.supports_varlen_decode(32)
+assert not support.supports_mixed_batch()
 ```
 
-Suppose we have hybrid attention backends (e.g., in mamba mixer models). In that case, we seek the minimum capability of all backends to determine the final capability of the model, and we might resolve the incompatible CUDA Graphs mode by downgrading the mode to the best fit one. For example, downgrading `FULL` mode to `FULL_AND_PIECEWISE` mode if the minimum capability is `UNIFORM_BATCH`, or `PIECEWISE` mode if the minimum capability is `NEVER` for -O3 compilation mode. For the complete fallback policy, please see the code for [this][vllm.v1.worker.gpu_model_runner.GPUModelRunner._check_and_update_cudagraph_mode].
+The paths have different kernel and metadata contracts. Variable-length support does not implicitly enable the uniform path, and decode support does not imply mixed prefill/decode support. A builder returns capabilities for its selected kernels and configuration through `get_cudagraph_support()`.
 
-The following table lists backends that support full CUDA Graphs at the time of writing.
+| Capability declaration | Meaning |
+| :--------------------- | :------ |
+| `AttentionCGSupport()` | No full attention graphs |
+| `AttentionCGSupport(uniform_decode=1)` | Single-token uniform decode |
+| `AttentionCGSupport(uniform_decode=None)` | Uniform decode without a query-length limit |
+| `AttentionCGSupport(uniform_decode=None, varlen_decode=8)` | Uniform decode and variable-length decode bounded by eight queries |
+| `AttentionCGSupport(uniform_decode=None, varlen_decode=None, mixed_batch=None)` | All three paths without query-length limits |
 
-| Attention Backend | cudagraph_support | Comments |
-| :---------------- | :---------------- | :------- |
-| FlashAttention v2 | `UNIFORM_BATCH` | Actually `ALWAYS` but workaround to fallback to `FULL_AND_PIECEWISE` for performance reason |
-| FlashAttention v3 | `ALWAYS` | has unified routine for both batches, so `FULL` mode is good |
-| Triton Attention | `ALWAYS` | prefer `FULL_AND_PIECEWISE` since it has different kernels for prefill/mixed and pure decode batches |
-| AITER FlashAttention | `UNIFORM_BATCH` | |
-| FlashInfer | `UNIFORM_SINGLE_TOKEN_DECODE` | Will be set to `UNIFORM_BATCH` when using TRTLLM attention on Blackwell |
-| FlashMLA | `UNIFORM_BATCH` | |
-| FlashInferMLA | `UNIFORM_BATCH` | |
-| FlashInferMLASparse | `UNIFORM_BATCH` | |
-| AITER MLA | `UNIFORM_SINGLE_TOKEN_DECODE` | |
-| CUTLASS MLA | `UNIFORM_SINGLE_TOKEN_DECODE` | |
-| Mamba attention | `UNIFORM_SINGLE_TOKEN_DECODE` | |
+For hybrid models and composite backends, each path's limits are intersected independently. For example, builders with `(uniform_decode=32, varlen_decode=8)` and `(uniform_decode=16, varlen_decode=32)` jointly support uniform decode through 16 and variable-length decode through eight. There is no single weakest backend; diagnostics retain the limiting backend for each path.
 
-Unlisted backends are all declared as `NEVER`.
+`FULL` captures the mixed-batch path, including its handling of decode. `FULL_DECODE_ONLY` and `FULL_AND_PIECEWISE` use a separate decode path, whose capability is checked at the configured query width. Mixed-batch limits must cover the largest captured token count, since one request can occupy the entire batch. Unsupported paths fall back according to [CompilationConfig.resolve_cudagraph_mode_and_sizes][vllm.config.compilation.CompilationConfig.resolve_cudagraph_mode_and_sizes].
+
+Adaptive verification checks the target builders' variable-length capability at the configured maximum verification width, alongside the separate device/CPU query-length mismatch requirement. It does not read trimmed GPU lengths back to the CPU. Draft graph capture checks the draft's own uniform query width. In Gemma4 DSpark with seven draft tokens, the target bound is eight queries per request; mixed-batch graphs remain unsupported by the FlashInfer path used here.
 
 ## Usage guide
 

@@ -49,7 +49,7 @@ class LinearAttentionMetadataBuilder(AttentionMetadataBuilder[LinearAttentionMet
     kv_cache_spec: MambaSpec
     reorder_batch_threshold: int = 1
 
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport(uniform_decode=1)
 
     def __init__(
         self,
@@ -122,7 +122,7 @@ class BailingLinearAttentionMetadataBuilder(LinearAttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        return AttentionCGSupport.UNIFORM_BATCH
+        return AttentionCGSupport(uniform_decode=None)
 
     def __init__(
         self,

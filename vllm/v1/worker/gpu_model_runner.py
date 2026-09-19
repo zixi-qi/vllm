@@ -131,7 +131,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
-    AttentionCGSupport,
+    AttentionCGSupportInfo,
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionType,
@@ -7164,8 +7164,7 @@ class GPUModelRunner(
         Then initialize the cudagraph_dispatcher based on the resolved
         cudagraph_mode.
         """
-        min_cg_support = AttentionCGSupport.ALWAYS
-        min_cg_attn_backend = None
+        attn_cg_support = AttentionCGSupportInfo()
 
         for attn_backend_set, kv_cache_group in zip(
             attention_backends, kv_cache_groups
@@ -7176,12 +7175,11 @@ class GPUModelRunner(
                 cg_support = builder_cls.get_cudagraph_support(
                     self.vllm_config, kv_cache_group.kv_cache_spec
                 )
-                if cg_support.value < min_cg_support.value:
-                    min_cg_support = cg_support
-                    min_cg_attn_backend = attn_backend.__name__
+                attn_cg_support = attn_cg_support.narrow(
+                    cg_support, attn_backend.__name__
+                )
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
-            min_cg_support,
-            min_cg_attn_backend,
+            attn_cg_support,
             self.uniform_decode_query_len,
             use_v2_model_runner=False,
             tensor_parallel_size=self.parallel_config.tensor_parallel_size,

@@ -93,6 +93,7 @@ from vllm.v1.worker.gpu.async_utils import (
 from vllm.v1.worker.gpu.attn_utils import (
     FastPrefillHelper,
     build_slot_mappings_by_layer,
+    get_attn_cg_support,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
@@ -633,7 +634,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_layer_names=draft_attn_layer_names,
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
-        attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
+        attn_cg_support = attn_cg_support.intersect(additional_attn_cg_support)
         # The speculator clears the flag at load time when the checkpoint has
         # no confidence head, so it holds the effective value.
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
@@ -693,9 +694,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.compilation_config.cudagraph_mode,
                 piecewise_capture_available=piecewise_capture_available,
             )
+        varlen_decode_support = None
+        if self.adaptive_verification is not None:
+            varlen_decode_support = get_attn_cg_support(
+                self.attn_groups,
+                self.vllm_config,
+                checked_layer_names=target_attn_layer_names,
+            ).intersect(additional_attn_cg_support)
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
-            attn_cg_support.min_cg_support,
-            attn_cg_support.min_cg_attn_backend,
+            attn_cg_support,
             self.decode_query_len,
             use_v2_model_runner=True,
             tensor_parallel_size=self.parallel_config.tensor_parallel_size,
@@ -703,6 +710,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
+            varlen_decode_support=varlen_decode_support,
         )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,

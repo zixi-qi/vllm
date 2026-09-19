@@ -283,7 +283,9 @@ def get_prefill_workspace_size(max_model_len: int):
 class FlashMLASparseMetadataBuilder(
     SparseMLACommonMetadataBuilder[FlashMLASparseMetadata]
 ):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     require_uniform_decodes: ClassVar[bool] = True
     hisparse_supports_multi_token_decode: ClassVar[bool] = True
     metadata_cls = FlashMLASparseMetadata

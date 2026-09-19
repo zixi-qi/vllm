@@ -49,7 +49,9 @@ class InklingSconvMetadata(AttentionMetadata):
 
 
 class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
 
     def __init__(
         self,

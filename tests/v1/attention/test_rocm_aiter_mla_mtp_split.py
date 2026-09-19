@@ -144,7 +144,7 @@ def _builder(
 
 
 def test_backend_declares_uniform_batch_support():
-    # UNIFORM/UNIFORM_BATCH is unconditional: MTP yields uniform qlen>1 and
+    # Uniform decode support is unconditional: MTP yields uniform qlen>1 and
     # non-MTP yields qlen==1, both uniform batches.
     assert (
         AiterMLAMetadataBuilder.query_len_support
@@ -152,7 +152,7 @@ def test_backend_declares_uniform_batch_support():
     )
     assert (
         AiterMLAMetadataBuilder._cudagraph_support
-        == rocm_aiter_mla.AttentionCGSupport.UNIFORM_BATCH
+        == rocm_aiter_mla.AttentionCGSupport(uniform_decode=None)
     )
 
 

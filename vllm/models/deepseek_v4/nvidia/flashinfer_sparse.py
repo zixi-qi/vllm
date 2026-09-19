@@ -177,13 +177,17 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
     """Varlen-capable metadata builder for the FlashInfer sparse MLA backend."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
 
 
 class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):

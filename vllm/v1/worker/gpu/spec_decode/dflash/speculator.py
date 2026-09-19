@@ -11,7 +11,6 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -121,16 +120,15 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-        supports_full = (
-            self.attn_cg_support.min_cg_support.value
-            >= AttentionCGSupport.UNIFORM_BATCH.value
+        supports_full = self.attn_cg_support.support.supports_uniform_decode(
+            self.num_query_per_req
         )
         if wants_full and not supports_full:
             logger.warning(
                 "%s draft attention (%s) does not support full CUDA graphs; "
                 "running the draft eagerly.",
                 self._speculator_name,
-                self.attn_cg_support.min_cg_attn_backend,
+                self.attn_cg_support.uniform_decode_backend,
             )
         # PIECEWISE cudagraphs are not supported for dflash.
         if wants_full and supports_full:

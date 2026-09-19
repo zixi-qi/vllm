@@ -245,7 +245,9 @@ class FlashInferMLASparseMetadataBuilder(
     """Builder for FlashInfer MLA Sparse attention metadata."""
 
     metadata_cls = FlashInferMLASparseMetadata
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
 
     def __init__(
         self,
@@ -272,7 +274,9 @@ class FlashInferMLASparseMetadataBuilder(
 class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilder):
     """Metadata builder for the SM100 TRT-LLM sparse MLA kernel."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
     hisparse_supports_multi_token_decode: ClassVar[bool] = True
 
     def __init__(

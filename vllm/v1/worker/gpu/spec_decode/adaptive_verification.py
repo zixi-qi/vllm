@@ -15,7 +15,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backend import AttentionCGSupportInfo
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.async_utils import StepTimingSample, stream
 from vllm.v1.worker.gpu.attn_utils import (
@@ -28,7 +28,6 @@ _PROFILE_REPLAYS = 5
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.states import RequestState
     from vllm.v1.worker.utils import AttentionGroup
@@ -461,7 +460,7 @@ def maybe_create_adaptive_verification_manager(
     max_total_logits: int,
     vllm_config: "VllmConfig",
     target_layer_names: set[str] | None = None,
-    additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+    additional_attn_cg_support: AttentionCGSupportInfo | None = None,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -488,18 +487,16 @@ def maybe_create_adaptive_verification_manager(
             checked_layer_names=target_layer_names,
         )
         if additional_attn_cg_support is not None:
-            target_attn_cg_support = target_attn_cg_support.narrow(
-                *additional_attn_cg_support
+            target_attn_cg_support = target_attn_cg_support.intersect(
+                additional_attn_cg_support
             )
-    if (
-        target_attn_cg_support.min_cg_support.value
-        < AttentionCGSupport.VARLEN_DECODE.value
-    ):
+    max_query_len = req_states.num_speculative_steps + num_bonus_tokens
+    if not target_attn_cg_support.support.supports_varlen_decode(max_query_len):
         raise ValueError(
-            "Adaptive verification captures varlen decode cudagraphs, so every"
-            " target attention builder must report VARLEN_DECODE or ALWAYS, but "
-            f"{target_attn_cg_support.min_cg_attn_backend} reports "
-            f"{target_attn_cg_support.min_cg_support}. Pass "
+            "Adaptive verification requires variable-length decode CUDA graphs"
+            f" with query lengths bounded by {max_query_len}, but "
+            f"{target_attn_cg_support.varlen_decode_backend} reports "
+            f"{target_attn_cg_support.support}. Pass "
             "enable_adaptive_verification=false in the speculative config, or "
             "use a backend that does."
         )

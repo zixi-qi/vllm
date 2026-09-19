@@ -127,8 +127,8 @@ def create_whisper_attention_backend_with_block_pooling(
         # Full cudagraphs only for uniform single-token decode: capture bakes in
         # tensor addresses, so `build` writes metadata into persistent buffers
         # (below). Prefill/mixed batches fall back to piecewise.
-        _cudagraph_support: ClassVar[AttentionCGSupport] = (
-            AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+            uniform_decode=1
         )
         # Disable the update_block_table fast path: it would bypass block pooling
         # by splicing the raw slot_mapping/block_table into cached metadata.

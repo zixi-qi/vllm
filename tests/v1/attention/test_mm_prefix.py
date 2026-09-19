@@ -796,12 +796,12 @@ def test_composite_shared_cache_across_image_and_causal_steps(
         ).to(DEVICE)
         layer.mm_prefix_clamp_sliding_window = window is not None
         assert backend.get_builder_cls().get_cudagraph_support(cfg, spec) == (
-            AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+            AttentionCGSupport(uniform_decode=1)
         )
         if window:
             layer.mm_prefix_clamp_sliding_window = False
             assert backend.get_builder_cls().get_cudagraph_support(cfg, spec) == (
-                AttentionCGSupport.NEVER
+                AttentionCGSupport()
             )
             layer.mm_prefix_clamp_sliding_window = True
         builder = backend.get_builder_cls()(spec, ["composite_test"], cfg, DEVICE)

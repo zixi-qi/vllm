@@ -105,7 +105,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
     metadata_cls = PleShortConvAttentionMetadata
     # Spec-decode requires a uniform (multi-token) decode batch for full
     # CUDA graph capture, matching the GDN backend.
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support = AttentionCGSupport(uniform_decode=None)
     reorder_batch_threshold: int = 1
     supports_update_block_table = False
 

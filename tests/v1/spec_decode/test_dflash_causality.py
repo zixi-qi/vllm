@@ -11,14 +11,48 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models.qwen3_dflash import (
     _dflash_layer_causal,
     _get_dflash_fc_input_size,
     dflash_has_any_non_causal,
 )
+from vllm.v1.attention.backend import AttentionCGSupport, AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
+
+
+@pytest.mark.parametrize(
+    "support,width,expected",
+    [
+        (AttentionCGSupport(uniform_decode=8), 8, CUDAGraphMode.FULL_DECODE_ONLY),
+        (AttentionCGSupport(uniform_decode=8), 9, CUDAGraphMode.NONE),
+        (AttentionCGSupport(varlen_decode=None), 8, CUDAGraphMode.NONE),
+        (AttentionCGSupport(mixed_batch=None), 8, CUDAGraphMode.NONE),
+    ],
+)
+def test_draft_graph_capture_checks_its_uniform_query_width(
+    monkeypatch, support, width, expected
+):
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator
+
+    monkeypatch.setattr(
+        speculator,
+        "DFlashCudaGraphManager",
+        lambda _config, _device, mode, **kwargs: SimpleNamespace(mode=mode),
+    )
+    draft = SimpleNamespace(
+        attn_cg_support=AttentionCGSupportInfo().narrow(support, "Draft"),
+        num_query_per_req=width,
+        _speculator_name="DFlash",
+        vllm_config=None,
+        device=None,
+    )
+    speculator.DFlashSpeculator.init_cudagraph_manager(
+        draft, CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    assert draft.query_cudagraph_manager.mode == expected
 
 
 def _config(num_hidden_layers, layer_types=None, causal_override=None, is_causal=None):

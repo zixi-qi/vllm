@@ -111,7 +111,7 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
 @dataclass
 class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport()
 
     def __init__(
         self,

@@ -116,7 +116,9 @@ def _get_multi_ctas_kv_counter_buffer(
 
 
 class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     # Non-causal DSpark blocks are flattened to single-token rows in forward_mqa.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True

@@ -10,7 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import Attention
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backend import (
-    AttentionCGSupport,
+    AttentionCGSupportInfo,
     AttentionType,
     CommonAttentionMetadata,
 )
@@ -143,20 +143,16 @@ class EncoderOnlyModelState(DefaultModelState):
         )
         return model_inputs
 
-    def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
-        # Encoder groups are built here rather than in init_attn_backend, so
-        # their cudagraph support must be surfaced to the runner separately.
-        support = AttentionCGSupport.ALWAYS
-        backend: str | None = None
+    def get_additional_cg_support(self) -> AttentionCGSupportInfo:
+        # Encoder groups are built outside init_attn_backend.
+        support = AttentionCGSupportInfo()
         for group in self.encoder_attn_groups:
             builder = group.get_metadata_builder(0)
-            cg_support = builder.get_cudagraph_support(
-                self.vllm_config, group.kv_cache_spec
+            support = support.narrow(
+                builder.get_cudagraph_support(self.vllm_config, group.kv_cache_spec),
+                group.backend.__name__,
             )
-            if cg_support.value < support.value:
-                support = cg_support
-                backend = group.backend.__name__
-        return support, backend
+        return support
 
     def prepare_attn(
         self,

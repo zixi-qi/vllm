@@ -8,9 +8,8 @@ import numpy as np
 import pytest
 
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backend import AttentionCGSupport, AttentionCGSupportInfo
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
-from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -62,10 +61,17 @@ def test_resolve_adaptive_cudagraph_mode(mode, piecewise_capture_available, expe
 @pytest.mark.parametrize(
     "target_support,device_offsets,error",
     [
-        (AttentionCGSupport.ALWAYS, True, None),
-        (AttentionCGSupport.VARLEN_DECODE, True, None),
-        (AttentionCGSupport.UNIFORM_BATCH, True, "VARLEN_DECODE or ALWAYS"),
-        (AttentionCGSupport.VARLEN_DECODE, False, "trims verification requests"),
+        (
+            AttentionCGSupport(
+                uniform_decode=None, varlen_decode=None, mixed_batch=None
+            ),
+            True,
+            None,
+        ),
+        (AttentionCGSupport(varlen_decode=8), True, None),
+        (AttentionCGSupport(varlen_decode=7), True, "query lengths bounded by 8"),
+        (AttentionCGSupport(uniform_decode=None), True, "query lengths bounded by 8"),
+        (AttentionCGSupport(varlen_decode=8), False, "trims verification requests"),
     ],
 )
 def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
@@ -95,11 +101,11 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
     groups = [
         [
             group("target", target_support),
-            group("draft", AttentionCGSupport.UNIFORM_BATCH),
+            group("draft", AttentionCGSupport(uniform_decode=None)),
         ]
     ]
-    runner_support = AttentionCGSupportInfo(
-        AttentionCGSupport.UNIFORM_BATCH, "DraftBackend"
+    runner_support = AttentionCGSupportInfo().narrow(
+        AttentionCGSupport(uniform_decode=None), "DraftBackend"
     )
     created = object()
     monkeypatch.setattr(
@@ -113,7 +119,7 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
             enable_adaptive_verification=True,
             attn_groups=groups,
             attn_cg_support=runner_support,
-            req_states=object(),
+            req_states=SimpleNamespace(num_speculative_steps=7),
             query_start_loc=object(),
             num_bonus_tokens=1,
             max_total_logits=1,
@@ -121,7 +127,7 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
             target_layer_names={"target"},
         )
         assert manager is created
-    assert runner_support.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
+    assert runner_support.support == AttentionCGSupport(uniform_decode=None)
 
 
 def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():

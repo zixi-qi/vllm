@@ -97,7 +97,9 @@ class TritonAttentionMetadata:
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
     # Step-dependent fields reference persistent input buffers directly.
     supports_draft_decode_metadata_update = True
 

@@ -37,7 +37,9 @@ if TYPE_CHECKING:
 class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
     """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
 
 
 class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):

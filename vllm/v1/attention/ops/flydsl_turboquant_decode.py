@@ -670,7 +670,7 @@ def flydsl_turboquant_decode_attention(
     # ---- Partition count (FA2 split-KV) ----------------------------------
     #
     # FlyDSL runs INSIDE FULL cudagraph (TurboQuantMetadataBuilder._cudagraph_
-    # support = UNIFORM_BATCH). That means the gridDim baked at capture
+    # uniform-decode support). That means the gridDim baked at capture
     # time MUST equal the gridDim at replay — the kernel launch parameters
     # are recorded into the captured graph. So `num_partitions` (which
     # becomes gridDim.z) MUST be derived from a stable source that produces
@@ -799,7 +799,7 @@ def flydsl_turboquant_decode_attention(
     if not _LOG_INVOKED_ONCE:
         _LOG_INVOKED_ONCE = True
         logger.info(
-            "FlyDSL launcher invoked (UNIFORM_BATCH cudagraph): "
+            "FlyDSL launcher invoked (uniform decode cudagraph): "
             "B=%d Hk=%d Hq=%d D=%d QG=%d num_partitions=%d (actual=%d, "
             "cap=%d) TGPP=%d max_bps=%d block_size=%d max_seq_len=%d "
             "hw_v_transpose=%s (coverage=%d tokens, worst_case=%d tokens)",

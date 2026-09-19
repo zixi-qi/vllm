@@ -979,10 +979,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        """Get the cudagraph support level for FlashInfer attention."""
+        """Get CUDA graph capabilities for the selected FlashInfer paths."""
         # XQA lacks LSE for DCP; DCP also cannot graph variable-length trtllm-gen.
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
-            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+            return AttentionCGSupport(uniform_decode=1)
 
         kv_specs = iter_layer_specs(kv_cache_spec)
         num_qo_heads = vllm_config.model_config.get_num_attention_heads(
@@ -1014,10 +1014,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 and cls._get_flashinfer_trtllm_api_decode_kernel()
                 == FlashInferDecodeKernel.TRTLLM_GEN
             ):
-                return AttentionCGSupport.VARLEN_DECODE
-            return AttentionCGSupport.UNIFORM_BATCH
+                return AttentionCGSupport(
+                    uniform_decode=None,
+                    varlen_decode=1 + speculative_config.num_speculative_tokens,
+                )
+            return AttentionCGSupport(uniform_decode=None)
         else:
-            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+            return AttentionCGSupport(uniform_decode=1)
 
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:

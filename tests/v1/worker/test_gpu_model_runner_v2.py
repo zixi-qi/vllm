@@ -9,6 +9,7 @@ import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.v1.attention.backend import AttentionCGSupportInfo
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -40,7 +41,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     )
     runner.jit_warmup_registry = JitWarmupRegistry(runner.vllm_config)
     runner.model_state = SimpleNamespace(
-        get_additional_cg_support=lambda: (),
+        get_additional_cg_support=AttentionCGSupportInfo,
         num_new_sampled_tokens_per_step=1,
     )
     runner.speculator = None
@@ -78,11 +79,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         ],
     )
 
-    class FakeAttnCGSupport:
-        def narrow(self, *args):
-            return self
-
-    attn_cg_support = FakeAttnCGSupport()
+    attn_cg_support = AttentionCGSupportInfo()
     monkeypatch.setattr(
         model_runner_module,
         "init_attn_backend",

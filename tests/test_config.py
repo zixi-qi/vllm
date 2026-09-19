@@ -50,7 +50,7 @@ from vllm.transformers_utils.config import (
     get_pooling_config,
     try_get_dense_modules,
 )
-from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backend import AttentionCGSupport, AttentionCGSupportInfo
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -704,8 +704,7 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
     compilation_config.post_init_cudagraph_sizes()
 
     cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
-        AttentionCGSupport.ALWAYS,
-        "FakeAttentionBackend",
+        AttentionCGSupportInfo(),
         uniform_decode_query_len=4,
         use_v2_model_runner=use_v2_model_runner,
         tensor_parallel_size=1,
@@ -718,12 +717,43 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
 @pytest.mark.parametrize(
     ("mode", "piecewise_capture_available", "attention_support", "expected"),
     [
-        ("PIECEWISE", False, "ALWAYS", "NONE"),
-        ("FULL_AND_PIECEWISE", False, "ALWAYS", "FULL_DECODE_ONLY"),
-        ("FULL_DECODE_ONLY", False, "ALWAYS", "FULL_DECODE_ONLY"),
-        ("FULL_DECODE_ONLY", False, "NEVER", "NONE"),
-        ("FULL_AND_PIECEWISE", True, "VARLEN_DECODE", "FULL_AND_PIECEWISE"),
-        ("FULL", True, "VARLEN_DECODE", "FULL_DECODE_ONLY"),
+        (
+            "PIECEWISE",
+            False,
+            AttentionCGSupport(
+                uniform_decode=None, varlen_decode=None, mixed_batch=None
+            ),
+            "NONE",
+        ),
+        (
+            "FULL_AND_PIECEWISE",
+            False,
+            AttentionCGSupport(
+                uniform_decode=None, varlen_decode=None, mixed_batch=None
+            ),
+            "FULL_DECODE_ONLY",
+        ),
+        (
+            "FULL_DECODE_ONLY",
+            False,
+            AttentionCGSupport(
+                uniform_decode=None, varlen_decode=None, mixed_batch=None
+            ),
+            "FULL_DECODE_ONLY",
+        ),
+        ("FULL_DECODE_ONLY", False, AttentionCGSupport(), "NONE"),
+        (
+            "FULL_AND_PIECEWISE",
+            True,
+            AttentionCGSupport(uniform_decode=None, varlen_decode=8),
+            "FULL_AND_PIECEWISE",
+        ),
+        (
+            "FULL",
+            True,
+            AttentionCGSupport(uniform_decode=None, varlen_decode=8),
+            "FULL_DECODE_ONLY",
+        ),
     ],
 )
 def test_resolve_cudagraph_mode_uses_loaded_piecewise_provider(
@@ -736,8 +766,7 @@ def test_resolve_cudagraph_mode_uses_loaded_piecewise_provider(
     )
 
     resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
-        AttentionCGSupport[attention_support],
-        "FakeAttentionBackend",
+        AttentionCGSupportInfo().narrow(attention_support, "FakeAttentionBackend"),
         piecewise_capture_available=piecewise_capture_available,
     )
 
@@ -777,6 +806,115 @@ def test_late_piecewise_restrictions_without_compilation(monkeypatch, engine_kwa
     assert config.compilation_config.max_cudagraph_capture_size == 0
 
 
+@pytest.mark.parametrize(
+    "support,width,varlen,mode,capture_size,expected",
+    [
+        (
+            AttentionCGSupport(uniform_decode=32, varlen_decode=16),
+            32,
+            False,
+            "FULL_DECODE_ONLY",
+            64,
+            "FULL_DECODE_ONLY",
+        ),
+        (
+            AttentionCGSupport(uniform_decode=32, varlen_decode=16),
+            16,
+            True,
+            "FULL_DECODE_ONLY",
+            64,
+            "FULL_DECODE_ONLY",
+        ),
+        (
+            AttentionCGSupport(uniform_decode=32, varlen_decode=16),
+            17,
+            True,
+            "FULL_DECODE_ONLY",
+            64,
+            "NONE",
+        ),
+        (
+            AttentionCGSupport(varlen_decode=8),
+            8,
+            True,
+            "FULL_DECODE_ONLY",
+            64,
+            "FULL_DECODE_ONLY",
+        ),
+        (AttentionCGSupport(varlen_decode=8), 8, False, "FULL_DECODE_ONLY", 64, "NONE"),
+        (
+            AttentionCGSupport(uniform_decode=None),
+            8,
+            True,
+            "FULL_DECODE_ONLY",
+            64,
+            "NONE",
+        ),
+        (AttentionCGSupport(mixed_batch=None), 8, False, "FULL", 64, "FULL"),
+        (
+            AttentionCGSupport(mixed_batch=None),
+            8,
+            False,
+            "FULL_DECODE_ONLY",
+            64,
+            "NONE",
+        ),
+        (
+            AttentionCGSupport(uniform_decode=8, mixed_batch=8),
+            8,
+            False,
+            "FULL",
+            8,
+            "FULL",
+        ),
+        (
+            AttentionCGSupport(uniform_decode=8, mixed_batch=8),
+            8,
+            False,
+            "FULL",
+            16,
+            "FULL_DECODE_ONLY",
+        ),
+    ],
+)
+def test_resolve_cudagraph_mode_checks_the_selected_path_and_query_bound(
+    support, width, varlen, mode, capture_size, expected
+):
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode[mode],
+        cudagraph_capture_sizes=[capture_size],
+        max_cudagraph_capture_size=capture_size,
+    )
+    info = AttentionCGSupportInfo().narrow(support, "LimitedBackend")
+    resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
+        info,
+        uniform_decode_query_len=width,
+        use_v2_model_runner=True,
+        varlen_decode_support=info if varlen else None,
+    )
+    assert resolved == CUDAGraphMode[expected]
+
+
+def test_resolve_cudagraph_mode_preserves_target_varlen_with_uniform_only_draft():
+    target = AttentionCGSupportInfo().narrow(
+        AttentionCGSupport(varlen_decode=8), "Target"
+    )
+    all_layers = target.narrow(AttentionCGSupport(uniform_decode=8), "Draft")
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    assert (
+        compilation_config.resolve_cudagraph_mode_and_sizes(
+            all_layers,
+            uniform_decode_query_len=8,
+            use_v2_model_runner=True,
+            varlen_decode_support=target,
+        )
+        == CUDAGraphMode.FULL_DECODE_ONLY
+    )
+
+
 def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
     """Cudagraph memory profiling uses a minimal KV cache, so the Mamba
     block-count guard must only fire for the real cache sizing."""
@@ -787,8 +925,7 @@ def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
     )
     with pytest.raises(ValueError, match="exceeds available Mamba cache blocks"):
         compilation_config.resolve_cudagraph_mode_and_sizes(
-            AttentionCGSupport.ALWAYS,
-            "FakeAttentionBackend",
+            AttentionCGSupportInfo(),
             uniform_decode_query_len=1,
             use_v2_model_runner=True,
             tensor_parallel_size=1,
@@ -800,8 +937,7 @@ def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
     )
     cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
-        AttentionCGSupport.ALWAYS,
-        "FakeAttentionBackend",
+        AttentionCGSupportInfo(),
         uniform_decode_query_len=1,
         use_v2_model_runner=True,
         tensor_parallel_size=1,

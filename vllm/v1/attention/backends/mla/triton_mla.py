@@ -50,8 +50,8 @@ def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
 
 
 class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=1
     )
     # Non-causal DSpark block is flattened to one decode row per query token in
     # forward_mqa, so no intra-block causal masking is required.
@@ -63,15 +63,10 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        """Report UNIFORM_BATCH where a non-causal multi-token block is served.
+        """Support uniform multi-token graphs for non-causal decode blocks.
 
-        ``_cudagraph_support`` is a class constant, so serving the DSpark
-        draft's (1 + num_spec) block through the decode path reports
-        UNIFORM_SINGLE_TOKEN_DECODE and, because the engine takes the minimum
-        over all attention groups, downgrades the *whole* engine off full
-        cudagraphs. ``forward_mqa`` flattens that block with
-        ``repeat_interleave`` on a Python int and performs no device->host
-        sync, so it does satisfy the UNIFORM_BATCH contract.
+        ``forward_mqa`` flattens the draft block using ``repeat_interleave``
+        on a Python int without device-to-host synchronization.
 
         ``non_causal_multi_token_decode`` is a KV-cache-group property, not a
         per-layer one: ``MLAAttentionSpec.merge`` ORs it over every layer in
@@ -82,7 +77,7 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         as well.
         """
         if getattr(kv_cache_spec, "non_causal_multi_token_decode", False):
-            return AttentionCGSupport.UNIFORM_BATCH
+            return AttentionCGSupport(uniform_decode=None)
         return cls._cudagraph_support
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):

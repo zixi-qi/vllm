@@ -209,7 +209,9 @@ class MiniMaxM3IndexerMetadataBuilder(
     parallel subclasses that each own their full ``build`` (no shared code)."""
 
     # Full cudagraphs for uniform decode batches (incl. spec-decode verify).
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     # Raised to 1 + num_speculative_tokens by _init_reorder_batch_threshold when
     # spec decode is on; matches the main builder so the splits agree.
     reorder_batch_threshold: int = 1

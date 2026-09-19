@@ -14,7 +14,12 @@ import torch
 
 import vllm.v1.hisparse.binding as attn_utils_module
 from tests.v1.attention.utils import dense_kv_cache_views
-from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionCGSupportInfo,
+    MultipleOf,
+)
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.binding import allocate_hisparse_kv_caches
 from vllm.v1.kv_cache_interface import (
@@ -102,6 +107,34 @@ class _FakeMetadataBuilder:
         return self.support
 
 
+def test_cudagraph_capabilities_intersect_independent_query_limits():
+    """Different backends can limit different paths; neither is weakest."""
+    first = AttentionCGSupport(uniform_decode=32, varlen_decode=8, mixed_batch=None)
+    second = AttentionCGSupport(uniform_decode=16, varlen_decode=32)
+    info = AttentionCGSupportInfo().narrow(first, "First").narrow(second, "Second")
+
+    assert info.support == second.intersect(first)
+    assert info.support.supports_uniform_decode(16)
+    assert not info.support.supports_uniform_decode(17)
+    assert info.support.supports_varlen_decode(8)
+    assert not info.support.supports_varlen_decode(9)
+    assert not info.support.supports_mixed_batch(1)
+    assert info.uniform_decode_backend == "Second"
+    assert info.varlen_decode_backend == "First"
+    assert info.mixed_batch_backend == "Second"
+
+    # Separately built encoder groups must retain each limiting backend too.
+    encoder = AttentionCGSupportInfo().narrow(
+        AttentionCGSupport(uniform_decode=4, varlen_decode=None, mixed_batch=None),
+        "Encoder",
+    )
+    combined = info.intersect(encoder)
+    assert combined.support.uniform_decode == 4
+    assert combined.uniform_decode_backend == "Encoder"
+    assert combined.varlen_decode_backend == "First"
+    assert combined.mixed_batch_backend == "Second"
+
+
 class _TargetBackend:
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
@@ -128,7 +161,11 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         0,  # type: ignore[arg-type]
     )
     target_group.metadata_builders = [
-        _FakeMetadataBuilder(AttentionCGSupport.ALWAYS)  # type: ignore[list-item]
+        _FakeMetadataBuilder(
+            AttentionCGSupport(
+                uniform_decode=None, varlen_decode=None, mixed_batch=None
+            )
+        )  # type: ignore[list-item]
     ]
     draft_group = AttentionGroup(
         _DraftBackend,
@@ -137,14 +174,14 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         0,  # type: ignore[arg-type]
     )
     draft_group.metadata_builders = [
-        _FakeMetadataBuilder(AttentionCGSupport.UNIFORM_BATCH)  # type: ignore[list-item]
+        _FakeMetadataBuilder(AttentionCGSupport(uniform_decode=None))  # type: ignore[list-item]
     ]
     groups = [[target_group, draft_group]]
 
     # The runner-wide execution mode must still honor the drafter's limit.
     unfiltered = get_attn_cg_support(groups, None)  # type: ignore[arg-type]
-    assert unfiltered.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
-    assert unfiltered.min_cg_attn_backend == "_DraftBackend"
+    assert unfiltered.support == AttentionCGSupport(uniform_decode=None)
+    assert unfiltered.varlen_decode_backend == "_DraftBackend"
 
     # Adaptive verification validates only the target's varlen graphs.
     target_only = get_attn_cg_support(
@@ -152,8 +189,10 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         None,  # type: ignore[arg-type]
         checked_layer_names={"target"},
     )
-    assert target_only.min_cg_support == AttentionCGSupport.ALWAYS
-    assert target_only.min_cg_attn_backend is None
+    assert target_only.support == AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
+    assert target_only.varlen_decode_backend is None
     assert (
         get_query_lens_mismatch_unsupported_backend(
             groups,
@@ -169,7 +208,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         None,  # type: ignore[arg-type]
         checked_layer_names={"target"},
     )
-    assert target_with_shared_group.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
+    assert target_with_shared_group.support == AttentionCGSupport(uniform_decode=None)
     assert (
         get_query_lens_mismatch_unsupported_backend(
             groups,

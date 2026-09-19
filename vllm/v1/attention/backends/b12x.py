@@ -269,7 +269,9 @@ class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
     graph eligibility.
     """
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     supports_update_block_table: bool = True
 
     @classmethod

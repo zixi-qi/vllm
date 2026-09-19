@@ -554,29 +554,97 @@ class CommonAttentionMetadata:
 M = TypeVar("M")
 
 
-class AttentionCGSupport(Enum):
-    """Constants for the cudagraph support of the attention backend
-    Here we do not consider the cascade attention, as currently
-    it is never cudagraph supported."""
+@dataclass(frozen=True)
+class AttentionCGSupport:
+    """Independent full CUDA graph capabilities of an attention builder.
 
-    ALWAYS = 4
-    """Cudagraph always supported; supports mixed-prefill-decode"""
-    VARLEN_DECODE = 3
-    """FULL graphs support variable-length queries within the decode bound."""
-    UNIFORM_BATCH = 2
-    """Cudagraph supported for batches the only contain query lengths that are
-    the same, this can be used for spec-decode
-        i.e. "decodes" are 1 + num_speculative_tokens"""
-    UNIFORM_SINGLE_TOKEN_DECODE = 1
-    """Cudagraph supported for batches the only contain query_len==1 decodes"""
-    NEVER = 0
-    """NO cudagraph support"""
+    Each limit is a maximum query length per request: 0 disables that path,
+    and None imposes no query-length limit. Support for one path does not
+    imply support for another. Cascade attention is not covered.
+    """
+
+    uniform_decode: int | None = 0
+    varlen_decode: int | None = 0
+    mixed_batch: int | None = 0
+
+    def __post_init__(self) -> None:
+        for limit in (self.uniform_decode, self.varlen_decode, self.mixed_batch):
+            if limit is not None and limit < 0:
+                raise ValueError("CUDA graph query-length limits must be nonnegative")
+
+    @staticmethod
+    def _supports(limit: int | None, query_len: int | None) -> bool:
+        if query_len is None:
+            return limit is None
+        return query_len > 0 and (limit is None or query_len <= limit)
+
+    def supports_uniform_decode(self, query_len: int) -> bool:
+        return self._supports(self.uniform_decode, query_len)
+
+    def supports_varlen_decode(self, max_query_len: int) -> bool:
+        return self._supports(self.varlen_decode, max_query_len)
+
+    def supports_mixed_batch(self, max_query_len: int | None = None) -> bool:
+        return self._supports(self.mixed_batch, max_query_len)
+
+    def intersect(self, *others: "AttentionCGSupport") -> "AttentionCGSupport":
+        """Intersect each execution path independently across builders."""
+        supports = (self, *others)
+
+        def limit(values: list[int | None]) -> int | None:
+            return min((v for v in values if v is not None), default=None)
+
+        return AttentionCGSupport(
+            uniform_decode=limit([s.uniform_decode for s in supports]),
+            varlen_decode=limit([s.varlen_decode for s in supports]),
+            mixed_batch=limit([s.mixed_batch for s in supports]),
+        )
+
+
+@dataclass(frozen=True)
+class AttentionCGSupportInfo:
+    """Intersected capabilities and the backend limiting each execution path."""
+
+    support: AttentionCGSupport = AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
+    uniform_decode_backend: str | None = None
+    varlen_decode_backend: str | None = None
+    mixed_batch_backend: str | None = None
+
+    def narrow(
+        self, support: AttentionCGSupport, backend: str | None
+    ) -> "AttentionCGSupportInfo":
+        return self.intersect(
+            AttentionCGSupportInfo(support, backend, backend, backend)
+        )
+
+    def intersect(self, other: "AttentionCGSupportInfo") -> "AttentionCGSupportInfo":
+        common = self.support.intersect(other.support)
+        return AttentionCGSupportInfo(
+            support=common,
+            uniform_decode_backend=(
+                other.uniform_decode_backend
+                if common.uniform_decode != self.support.uniform_decode
+                else self.uniform_decode_backend
+            ),
+            varlen_decode_backend=(
+                other.varlen_decode_backend
+                if common.varlen_decode != self.support.varlen_decode
+                else self.varlen_decode_backend
+            ),
+            mixed_batch_backend=(
+                other.mixed_batch_backend
+                if common.mixed_batch != self.support.mixed_batch
+                else self.mixed_batch_backend
+            ),
+        )
 
 
 class AttentionMetadataBuilder(ABC, Generic[M]):
     # Does this backend/builder support CUDA Graphs for attention (default: no).
     # Do not access directly. Call get_cudagraph_support() instead.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport()
     # Does this backend/builder reorder the batch?
     # If not, set this to None. Otherwise set it to the query
     # length that will be pulled into the front of the batch.
@@ -613,7 +681,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         vllm_config: "VllmConfig",
         kv_cache_spec: "KVCacheSpec",
     ) -> AttentionCGSupport:
-        """Get the cudagraph support level of this builder class."""
+        """Get the independent CUDA graph capabilities of this builder."""
         return cls._cudagraph_support
 
     def _init_reorder_batch_threshold(

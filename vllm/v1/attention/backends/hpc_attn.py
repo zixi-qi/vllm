@@ -106,7 +106,7 @@ class HpcAttnMetadata(AttentionMetadata):
 class HpcAttnMetadataBuilder(AttentionMetadataBuilder[HpcAttnMetadata]):
     """Build HpcAttnMetadata from CommonAttentionMetadata."""
 
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport(uniform_decode=1)
     reorder_batch_threshold: int = 1
 
     def __init__(
@@ -178,8 +178,8 @@ class HpcAttnMetadataBuilder(AttentionMetadataBuilder[HpcAttnMetadata]):
             and spec_config.num_speculative_tokens is not None
             and spec_config.num_speculative_tokens > 0
         ):
-            return AttentionCGSupport.UNIFORM_BATCH
-        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+            return AttentionCGSupport(uniform_decode=None)
+        return AttentionCGSupport(uniform_decode=1)
 
     def build(
         self,

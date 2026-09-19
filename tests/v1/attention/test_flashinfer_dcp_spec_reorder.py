@@ -74,7 +74,6 @@ def test_flashinfer_gqa_dcp_spec_decode_clamps_reorder_threshold(monkeypatch):
         builder.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
     )
     assert builder.reorder_batch_threshold == 1
-    assert (
-        FlashInferMetadataBuilder.get_cudagraph_support(vllm_config, kv_cache_spec)
-        == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    assert FlashInferMetadataBuilder.get_cudagraph_support(
+        vllm_config, kv_cache_spec
+    ) == AttentionCGSupport(uniform_decode=1)

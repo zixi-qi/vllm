@@ -55,7 +55,9 @@ def _get_workspace(
 
 
 class TokenspeedMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     # The kernel accepts an explicit causal mask, so a non-causal DSpark
     # block can remain fused instead of being flattened to single tokens.

@@ -108,7 +108,9 @@ class FlashMLAMetadata(MLACommonMetadata[FlashMLADecodeMetadata]):
 
 
 class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     reorder_batch_threshold: int = 128  # process small prefills with decode pathway
     # ^ TODO(matt): tune this

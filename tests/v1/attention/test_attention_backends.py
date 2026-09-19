@@ -1075,10 +1075,10 @@ def test_flashinfer_trtllm_gen_padded_decode_uses_varlen_offsets(
 @pytest.mark.parametrize(
     "adaptive,decode_kernel,expected",
     [
-        (None, "TRTLLM_GEN", AttentionCGSupport.UNIFORM_BATCH),
-        (False, "TRTLLM_GEN", AttentionCGSupport.UNIFORM_BATCH),
-        (True, "TRTLLM_GEN", AttentionCGSupport.VARLEN_DECODE),
-        (True, "XQA", AttentionCGSupport.UNIFORM_BATCH),
+        (None, "TRTLLM_GEN", AttentionCGSupport(uniform_decode=None)),
+        (False, "TRTLLM_GEN", AttentionCGSupport(uniform_decode=None)),
+        (True, "TRTLLM_GEN", AttentionCGSupport(uniform_decode=None, varlen_decode=8)),
+        (True, "XQA", AttentionCGSupport(uniform_decode=None)),
     ],
 )
 def test_flashinfer_varlen_decode_capability(
@@ -1088,7 +1088,9 @@ def test_flashinfer_varlen_decode_capability(
 
     config = SimpleNamespace(
         attention_config=SimpleNamespace(use_non_causal=False),
-        speculative_config=SimpleNamespace(enable_adaptive_verification=adaptive)
+        speculative_config=SimpleNamespace(
+            enable_adaptive_verification=adaptive, num_speculative_tokens=7
+        )
         if adaptive is not None
         else None,
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
@@ -1519,24 +1521,18 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
             )
             attn_metadata = builder.build(0, common_attn_metadata)
 
-    assert (
-        flashinfer_backend.FlashInferMetadataBuilder.get_cudagraph_support(
-            vllm_config, kv_cache_spec
-        )
-        == AttentionCGSupport.UNIFORM_BATCH
-    )
+    assert flashinfer_backend.FlashInferMetadataBuilder.get_cudagraph_support(
+        vllm_config, kv_cache_spec
+    ) == AttentionCGSupport(uniform_decode=None)
     wide_head_kv_cache_spec = FullAttentionSpec(
         block_size=vllm_config.cache_config.block_size,
         num_kv_heads=kv_cache_spec.num_kv_heads,
         head_size=512,
         dtype=vllm_config.model_config.dtype,
     )
-    assert (
-        flashinfer_backend.FlashInferMetadataBuilder.get_cudagraph_support(
-            vllm_config, wide_head_kv_cache_spec
-        )
-        == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    assert flashinfer_backend.FlashInferMetadataBuilder.get_cudagraph_support(
+        vllm_config, wide_head_kv_cache_spec
+    ) == AttentionCGSupport(uniform_decode=1)
     assert isinstance(
         attn_metadata.decode,
         flashinfer_backend.FlashInferTrtllmAPIDecode,

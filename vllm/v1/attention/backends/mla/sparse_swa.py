@@ -417,7 +417,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     """
 
     reorder_batch_threshold: int | None = None
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     supports_draft_decode_metadata_update = True
 
     def __init__(self, *args, **kwargs):

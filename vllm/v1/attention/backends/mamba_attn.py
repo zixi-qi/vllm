@@ -90,7 +90,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
     kv_cache_spec: MambaSpec
     metadata_cls: type[M]
     reorder_batch_threshold: int = 1
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
 
     # Will be disabled if speculative decoding is used
     supports_update_block_table: bool = True

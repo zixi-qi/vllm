@@ -431,10 +431,9 @@ def test_flashinfer_sparse_mla_adaptive_varlen_matches_sdpa(
     """Adaptive request boundaries must drive SM100 sparse index conversion."""
     backend_cls = FlashInferMLASparseTRTLLMBackend
     _skip_if_backend_unavailable(backend_cls, "fp8", 64)
-    assert (
-        backend_cls.get_builder_cls().get_cudagraph_support(None, None)
-        == AttentionCGSupport.ALWAYS
-    )
+    assert backend_cls.get_builder_cls().get_cudagraph_support(
+        None, None
+    ) == AttentionCGSupport(uniform_decode=None, varlen_decode=None, mixed_batch=None)
 
     device = torch.device(DEVICE_TYPE)
     seq_lens = [257, 270, 265, 276]

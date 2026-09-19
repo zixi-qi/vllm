@@ -42,7 +42,7 @@ def test_bailing_linear_attention_reports_uniform_batch_cudagraph_support():
         vllm_config, _create_mamba_spec()
     )
 
-    assert support == AttentionCGSupport.UNIFORM_BATCH
+    assert support == AttentionCGSupport(uniform_decode=None)
 
 
 def test_non_bailing_linear_attention_keeps_single_token_cudagraph_support():
@@ -57,7 +57,7 @@ def test_non_bailing_linear_attention_keeps_single_token_cudagraph_support():
         vllm_config, _create_mamba_spec()
     )
 
-    assert support == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    assert support == AttentionCGSupport(uniform_decode=1)
 
 
 def test_linear_attention_spec_decode_full_graph_metadata_pads_cache_slots():

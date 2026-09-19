@@ -664,7 +664,9 @@ def compute_kpool_tail_slot_mapping(
 class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
     """Build only the circular slot mapping needed by the storage-only tail."""
 
-    _cudagraph_support = AttentionCGSupport.ALWAYS
+    _cudagraph_support = AttentionCGSupport(
+        uniform_decode=None, varlen_decode=None, mixed_batch=None
+    )
     supports_update_block_table = False
     reorder_batch_threshold = None
 
@@ -784,8 +786,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
         if _supports_varlen_paged_mqa_logits() or _use_flattening(vllm_config):
-            return AttentionCGSupport.ALWAYS
-        return AttentionCGSupport.UNIFORM_BATCH
+            return AttentionCGSupport(
+                uniform_decode=None, varlen_decode=None, mixed_batch=None
+            )
+        return AttentionCGSupport(uniform_decode=None)
 
     def __init__(self, *args, block_table_width: int, **kwargs) -> None:
         super().__init__(*args, **kwargs)

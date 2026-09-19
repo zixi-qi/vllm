@@ -13,7 +13,7 @@ from vllm.model_executor.models.interfaces import (
     supports_encoder_cudagraph,
 )
 from vllm.tasks import GenerationTask
-from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backend import AttentionCGSupportInfo
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
@@ -126,14 +126,12 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
-    def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
-        """Cudagraph support of attention groups this ModelState builds outside
-        ``init_attn_backend`` (e.g. encoder-only layers).
+    def get_additional_cg_support(self) -> AttentionCGSupportInfo:
+        """Capabilities of attention groups built outside init_attn_backend.
 
-        Returns the minimum support level and its backend name. The default of
-        ``ALWAYS`` imposes no extra constraint on the runner's cudagraph mode.
+        The default imposes no additional constraints on the runner.
         """
-        return AttentionCGSupport.ALWAYS, None
+        return AttentionCGSupportInfo()
 
     def preprocess_state(
         self,

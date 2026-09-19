@@ -320,7 +320,9 @@ class Dots3NoteFlashAttnPrefillBackend(FlashAttnPrefillBackend):
 class Dots3NoteMLAMetadataBuilder(TritonMLAMetadataBuilder):
     """Keep decode on MQA and route prefill/mixed batches through FA3."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     query_len_support = QueryLenSupport.UNIFORM
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):

@@ -107,8 +107,8 @@ class MMPrefixAttentionRouting(CompositeAttentionRouting):
         if _has_unclamped_window(
             vllm_config.compilation_config.static_forward_context.values()
         ):
-            return AttentionCGSupport.NEVER
-        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+            return AttentionCGSupport()
+        return AttentionCGSupport(uniform_decode=1)
 
     @staticmethod
     def variant_uses_mm_prefix(variant: int) -> bool:
@@ -302,11 +302,11 @@ def create_composite_attention_backend(
 
         @classmethod
         def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
-            return min(
-                general_builder_cls.get_cudagraph_support(vllm_config, kv_cache_spec),
+            return general_builder_cls.get_cudagraph_support(
+                vllm_config, kv_cache_spec
+            ).intersect(
                 causal_builder_cls.get_cudagraph_support(vllm_config, kv_cache_spec),
                 routing_policy.get_cudagraph_support(vllm_config, kv_cache_spec),
-                key=lambda support: support.value,
             )
 
         def _builder(self, common_attn_metadata):

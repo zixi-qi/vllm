@@ -453,7 +453,7 @@ class AiterFlashAttentionMetadata:
 class AiterFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[AiterFlashAttentionMetadata]
 ):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support = AttentionCGSupport(uniform_decode=None)
 
     def __init__(
         self,

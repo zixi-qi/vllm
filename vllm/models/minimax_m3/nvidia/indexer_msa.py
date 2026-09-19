@@ -113,7 +113,9 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
     """Decode metadata is the cudagraph-safe Triton decode metadata; the prefill
     fmha plan is built eagerly (prefill batches are not captured)."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
 
     def __init__(
         self,

@@ -428,7 +428,9 @@ _FP8_PREFILL_TILE_Q = 256
 class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     # TODO(luka, lucas): audit this as part of:
     #  https://github.com/vllm-project/vllm/issues/22945
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport(
+        uniform_decode=None
+    )
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     # Served by passing the mask to the kernel; _build_decode turns away the
     # shapes AITER has no non-causal kernel for.

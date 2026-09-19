@@ -116,7 +116,7 @@ def default_breakable_cudagraph_architectures() -> frozenset[str]:
         # VLLM_USE_BREAKABLE_CUDAGRAPH=1.
         #
         # DeepseekV41ForCausalLM cannot torch.compile, and the ROCm sparse
-        # SWA backend only reports AttentionCGSupport.UNIFORM_BATCH. Default
+        # SWA backend only supports uniform decode graphs. Default
         # FULL_AND_PIECEWISE then dies at capture unless breakable CUDA
         # graphs are on. Enable this architecture so the published AMD
         # recipe can start.

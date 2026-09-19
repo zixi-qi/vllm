@@ -17,7 +17,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.attention.backend import (
-    AttentionCGSupport,
+    AttentionCGSupportInfo,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
@@ -47,24 +47,6 @@ if TYPE_CHECKING:
         BatchExecutionDescriptor,
         CudaGraphManager,
     )
-
-
-@dataclass(frozen=True)
-class AttentionCGSupportInfo:
-    min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
-    min_cg_attn_backend: str | None = None
-
-    def narrow(
-        self, support: AttentionCGSupport, backend: str | None
-    ) -> "AttentionCGSupportInfo":
-        """Return an info tightened by ``support`` if it is more restrictive.
-
-        Lets attention groups built outside ``init_attn_backend`` (e.g.
-        encoder-only layers) contribute to the runner's cudagraph decision.
-        """
-        if support.value < self.min_cg_support.value:
-            return AttentionCGSupportInfo(support, backend)
-        return self
 
 
 @dataclass(frozen=True)
@@ -283,9 +265,8 @@ def get_attn_cg_support(
     vllm_config: VllmConfig,
     checked_layer_names: set[str] | None = None,
 ) -> AttentionCGSupportInfo:
-    """Return the weakest CUDA graph support among the checked layers."""
-    min_cg_support = AttentionCGSupport.ALWAYS
-    min_cg_attn_backend = None
+    """Intersect CUDA graph capabilities of the checked layers."""
+    support = AttentionCGSupportInfo()
     for groups in attn_groups:
         for group in groups:
             if checked_layer_names is not None and checked_layer_names.isdisjoint(
@@ -293,17 +274,11 @@ def get_attn_cg_support(
             ):
                 continue
             builder = group.get_metadata_builder(0)
-            cg_support = builder.get_cudagraph_support(
-                vllm_config,
-                group.kv_cache_spec,
+            support = support.narrow(
+                builder.get_cudagraph_support(vllm_config, group.kv_cache_spec),
+                group.backend.__name__,
             )
-            if cg_support.value < min_cg_support.value:
-                min_cg_support = cg_support
-                min_cg_attn_backend = group.backend.__name__
-    return AttentionCGSupportInfo(
-        min_cg_support=min_cg_support,
-        min_cg_attn_backend=min_cg_attn_backend,
-    )
+    return support
 
 
 def get_query_lens_mismatch_unsupported_backend(

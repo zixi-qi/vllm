@@ -81,7 +81,7 @@ class GDNAttentionMetadata:
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support = AttentionCGSupport(uniform_decode=None)
 
     reorder_batch_threshold: int = 1
 

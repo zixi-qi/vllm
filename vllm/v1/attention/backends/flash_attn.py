@@ -550,19 +550,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     # spec-decode) then these graphs will not work for mixed prefill-decode
     # (unlike FA3). This is due to special max_query_len=1 packed-GQA handling
     # in FA2.
-    # In summary if we are running with spec decodes the graphs would
-    # work for mixed prefill-decode and uniform-decode. But for non-spec decodes
-    # the graphs would not work for mixed prefill-decode; sorta the inverse
-    # of UNIFORM_SINGLE_TOKEN_DECODE.
-    # There's probably a better way to describe this using `AttentionCGSupport`
-    # but for now just set it to `UNIFORM_BATCH` to get use to drop down
-    # to FULL_AND_PIECEWISE.
+    # Conservatively advertise only uniform decode for FA2, so mixed batches
+    # use piecewise graphs instead of the specialized decode capture.
     # TODO(luka, lucas): audit FA2 as part of:
     #  https://github.com/vllm-project/vllm/issues/22945
     _cudagraph_support = (
-        AttentionCGSupport.ALWAYS
+        AttentionCGSupport(uniform_decode=None, varlen_decode=None, mixed_batch=None)
         if get_flash_attn_version() == 3
-        else AttentionCGSupport.UNIFORM_BATCH
+        else AttentionCGSupport(uniform_decode=None)
     )
     supports_update_block_table: bool = True
 

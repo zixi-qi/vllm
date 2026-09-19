@@ -45,7 +45,7 @@ def create_chunked_local_attention_backend(
         ) -> AttentionCGSupport:
             # Explicit override in case the underlying builder specialized this getter.
             # @override omitted only because of mypy limitation due to type variable.
-            return AttentionCGSupport.NEVER
+            return AttentionCGSupport()
 
         def build(
             self,
