@@ -99,6 +99,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SHARED_REGION_GROUP_ID = -1
+# KV cache specs whose pages are replicated across TP ranks.
+_MLA_SPEC_TYPES = (MLAAttentionSpec, SlidingWindowMLASpec)
 
 
 def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
@@ -1418,6 +1420,10 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "NIXL host staging does not preserve CSA-linear shared tensors."
             )
+        if route_packed_layers and not all(
+            isinstance(spec, _MLA_SPEC_TYPES) for spec in self._layer_specs.values()
+        ):
+            raise NotImplementedError("PP push with packed KV caches requires MLA")
 
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
@@ -1452,11 +1458,6 @@ class NixlBaseConnectorWorker:
         # CSA-linear needs separate logical regions for attention and state
         # aliases even though every view shares one block-major allocation.
         packed_storage = packed_storage and not self._is_csa_linear
-        if route_packed_layers and any(
-            not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
-            for spec in self._layer_specs.values()
-        ):
-            raise NotImplementedError("PP push with packed KV caches requires MLA")
 
         layer_specs: dict[str, KVCacheSpec] = {}
         compressed_region_owners: dict[int, torch.Tensor] = {}
@@ -1537,9 +1538,7 @@ class NixlBaseConnectorWorker:
                 else logical_num_blocks * self._physical_blocks_per_logical_kv_block
             )
             base_addr = cache.data_ptr()
-            is_mla_region = isinstance(
-                layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
-            )
+            is_mla_region = isinstance(layer_spec, _MLA_SPEC_TYPES)
             logger.debug(
                 "Registering layer %s with cache shape: %s", layer_name, cache.shape
             )
