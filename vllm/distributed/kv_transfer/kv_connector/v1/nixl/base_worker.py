@@ -447,6 +447,14 @@ class NixlBaseConnectorWorker:
         """Whether PP push must match HMA/packed layers by name, not region index."""
         return self._tracks_region_layers() and self.pp_size > 1
 
+    def _compat_backend_name(self) -> str:
+        """Attention backend name folded into the handshake compatibility hash."""
+        if self._supports_pp_hma and self._has_packed_cache:
+            # PP can reorder the same backends across stages of a packed model,
+            # so hash the whole sorted set rather than whichever came first.
+            return ",".join(sorted(b.get_name() for b in self.attn_backends))
+        return self.backend_name
+
     def _align_remote_regions_by_layer(
         self, nixl_agent_meta: NixlAgentMetadata
     ) -> None:
@@ -1400,15 +1408,9 @@ class NixlBaseConnectorWorker:
             else None,
             is_mamba=self._has_mamba,
         )
-        backend_name = self.backend_name
-        if self._supports_pp_hma and self._has_packed_cache:
-            # PP can reorder the same backends across stages of a packed model.
-            backend_name = ",".join(
-                sorted(backend.get_name() for backend in self.attn_backends)
-            )
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config,
-            backend_name,
+            self._compat_backend_name(),
             transfer_mode=self._TRANSFER_MODE,
         )
 
