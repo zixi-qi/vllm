@@ -468,7 +468,7 @@ class NixlBaseConnectorWorker:
         """
         return (
             self._supports_pp_hma
-            and (self._is_hma_required or self._has_packed_cache)
+            and (self._is_hma_required or self._is_packed_layout)
             and not self._has_mamba
         )
 
@@ -478,7 +478,7 @@ class NixlBaseConnectorWorker:
 
     def _compat_backend_name(self) -> str:
         """Attention backend name folded into the handshake compatibility hash."""
-        if self._supports_pp_hma and self._has_packed_cache:
+        if self._supports_pp_hma and self._is_packed_layout:
             # PP can reorder the same backends across stages of a packed model,
             # so hash the whole sorted set rather than whichever came first.
             return ",".join(sorted(b.get_name() for b in self.attn_backends))
@@ -904,7 +904,7 @@ class NixlBaseConnectorWorker:
         self.host_buffer_kv_cache_layout = self.kv_cache_layout
         # Block-outermost layouts (BLHNC/BHLNC) pack every layer's page into one
         # block row of a shared allocation.
-        self._has_packed_cache = KVCacheLayout[self.kv_cache_layout].is_block_outermost
+        self._is_packed_layout = KVCacheLayout[self.kv_cache_layout].is_block_outermost
         logger.info(
             "Detected attention backend(s) %s",
             [backend.get_name() for backend in self.attn_backends],
@@ -1403,7 +1403,7 @@ class NixlBaseConnectorWorker:
         """Register the KV Cache data in nixl."""
 
         use_layer_name_routing = self._requires_layer_name_routing()
-        route_packed_layers = self._has_packed_cache and use_layer_name_routing
+        route_packed_layers = self._is_packed_layout and use_layer_name_routing
         self.transfer_topo = TransferTopology(
             tp_rank=self.transfer_tp_rank,
             tp_size=self.transfer_tp_size,
@@ -1641,7 +1641,7 @@ class NixlBaseConnectorWorker:
                 # Packed MLA rows register one whole-row region per allocation,
                 # so a block moves as one descriptor rather than one per layer.
                 packed_mla_row = (
-                    self._has_packed_cache and packed_storage and is_mla_region
+                    self._is_packed_layout and packed_storage and is_mla_region
                 )
                 # A layer-name-routed PP producer addresses only its own MLA
                 # pages, so it takes the per-layer branch instead of whole rows.
