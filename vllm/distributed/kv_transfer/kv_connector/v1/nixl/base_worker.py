@@ -1450,6 +1450,10 @@ class NixlBaseConnectorWorker:
         registration_ranges: dict[tuple[int, str], tuple[int, int, int]] = {}
         region_mem_types: list[str] = []
         seen_base_addresses: list[int] = []
+        # Region index by base address. A packed PP producer registers one
+        # region per layer instead, so aliases at one address (a layer and its
+        # SWA view) keep their own page geometry as distinct regions.
+        region_indices: dict[tuple[int, str | None], int] = {}
         self._ssm_region_indices = []
         self._scratch_region_indices = []
         self._ple_region_index = None
@@ -1692,8 +1696,9 @@ class NixlBaseConnectorWorker:
                     ]
 
             for base_addr, block_len, block_stride in region_specs:
-                if base_addr in seen_base_addresses and not route_packed_layers:
-                    region_index = seen_base_addresses.index(base_addr)
+                region_key = (base_addr, layer_name if route_packed_layers else None)
+                if region_key in region_indices:
+                    region_index = region_indices[region_key]
                     assert region_mem_types[region_index] == mem_type
                     self._region_is_mla[region_index] |= is_mla_region
                     if is_mla_region:
@@ -1704,6 +1709,7 @@ class NixlBaseConnectorWorker:
                         self.region_group_ids[region_index] = _SHARED_REGION_GROUP_ID
                 else:
                     region_index = len(seen_base_addresses)
+                    region_indices[region_key] = region_index
                     seen_base_addresses.append(base_addr)
                     self.block_len_per_layer.append(block_len)
                     self.block_stride_per_layer.append(block_stride)
