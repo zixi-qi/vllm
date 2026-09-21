@@ -522,34 +522,38 @@ class NixlBaseConnectorWorker:
         ]
         assert not missing, f"Remote is missing locally owned layers: {missing}"
 
-        packed_regions = {
-            remote_region_by_layer[name]
-            for name in nixl_agent_meta.packed_member_layouts
-        }
         remote_regions = [
             remote_region_by_layer[name] for name in self._transfer_layer_names
         ]
         _select_remote_regions(nixl_agent_meta, remote_regions)
         if nixl_agent_meta.region_names is not None:
             nixl_agent_meta.region_names = list(self._transfer_layer_names)
-        if nixl_agent_meta.packed_member_layouts:
-            for i, layer_name in enumerate(self._transfer_layer_names):
-                if remote_regions[i] not in packed_regions:
-                    continue
-                assert layer_name in nixl_agent_meta.packed_member_layouts, (
-                    f"Remote packed layer {layer_name!r} has no layout"
-                )
-                offset, page_size = nixl_agent_meta.packed_member_layouts[layer_name]
-                assert (
-                    0 <= offset < offset + page_size <= nixl_agent_meta.block_lens[i]
-                ), f"Remote packed layer {layer_name!r} escapes its block"
-                local_region = self._transfer_layer_region_indices[i]
-                assert page_size == self.block_len_per_layer[local_region], (
-                    f"Packed MLA page sizes must match for layer {layer_name!r}"
-                )
-                nixl_agent_meta.kv_caches_base_addr[i] += offset
-                nixl_agent_meta.block_lens[i] = page_size
-            nixl_agent_meta.packed_member_layouts = {}
+        # A packed remote row is addressed at each layer's page inside the
+        # block; the remote whole-row stride is kept as is.
+        layouts = nixl_agent_meta.packed_member_layouts
+        packed_regions = {remote_region_by_layer[name] for name in layouts}
+        transfer_layers = zip(
+            self._transfer_layer_names,
+            remote_regions,
+            self._transfer_layer_region_indices,
+            strict=True,
+        )
+        for i, (layer_name, remote_region, local_region) in enumerate(transfer_layers):
+            if remote_region not in packed_regions:
+                continue
+            assert layer_name in layouts, (
+                f"Remote packed layer {layer_name!r} has no layout"
+            )
+            offset, page_size = layouts[layer_name]
+            assert 0 <= offset < offset + page_size <= nixl_agent_meta.block_lens[i], (
+                f"Remote packed layer {layer_name!r} escapes its block"
+            )
+            assert page_size == self.block_len_per_layer[local_region], (
+                f"Packed MLA page sizes must match for layer {layer_name!r}"
+            )
+            nixl_agent_meta.kv_caches_base_addr[i] += offset
+            nixl_agent_meta.block_lens[i] = page_size
+        nixl_agent_meta.packed_member_layouts = {}
         # One layer per region keeps a second alignment pass a no-op.
         nixl_agent_meta.region_members = [[name] for name in self._transfer_layer_names]
 
