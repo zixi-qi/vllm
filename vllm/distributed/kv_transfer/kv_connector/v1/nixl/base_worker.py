@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
@@ -116,6 +116,33 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
     storage_ptrs = {cache.untyped_storage().data_ptr() for cache in caches}
     return len(block_strides) == len(storage_ptrs) == 1
+
+
+def _select_remote_regions(meta: NixlAgentMetadata, indices: Sequence[int]) -> None:
+    """Keep only ``indices`` of every per-region metadata field, in that order."""
+    num_regions = len(meta.kv_caches_base_addr)
+    assert all(
+        values is None or len(values) == num_regions
+        for values in (
+            meta.block_lens,
+            meta.block_strides,
+            meta.region_num_blocks,
+            meta.region_group_ids,
+            meta.region_names,
+            meta.region_mem_types,
+        )
+    ), "Remote region metadata lengths disagree"
+    meta.kv_caches_base_addr = [meta.kv_caches_base_addr[i] for i in indices]
+    meta.block_lens = [meta.block_lens[i] for i in indices]
+    meta.block_strides = [meta.block_strides[i] for i in indices]
+    if meta.region_num_blocks is not None:
+        meta.region_num_blocks = [meta.region_num_blocks[i] for i in indices]
+    if meta.region_group_ids is not None:
+        meta.region_group_ids = [meta.region_group_ids[i] for i in indices]
+    if meta.region_names is not None:
+        meta.region_names = [meta.region_names[i] for i in indices]
+    if meta.region_mem_types is not None:
+        meta.region_mem_types = [meta.region_mem_types[i] for i in indices]
 
 
 def _tensor_byte_span_end(cache: torch.Tensor) -> int:
@@ -502,27 +529,7 @@ class NixlBaseConnectorWorker:
         remote_regions = [
             remote_region_by_layer[name] for name in self._transfer_layer_names
         ]
-        nixl_agent_meta.kv_caches_base_addr = [
-            nixl_agent_meta.kv_caches_base_addr[i] for i in remote_regions
-        ]
-        nixl_agent_meta.block_lens = [
-            nixl_agent_meta.block_lens[i] for i in remote_regions
-        ]
-        nixl_agent_meta.block_strides = [
-            nixl_agent_meta.block_strides[i] for i in remote_regions
-        ]
-        if nixl_agent_meta.region_num_blocks is not None:
-            nixl_agent_meta.region_num_blocks = [
-                nixl_agent_meta.region_num_blocks[i] for i in remote_regions
-            ]
-        if nixl_agent_meta.region_group_ids is not None:
-            nixl_agent_meta.region_group_ids = [
-                nixl_agent_meta.region_group_ids[i] for i in remote_regions
-            ]
-        if nixl_agent_meta.region_mem_types is not None:
-            nixl_agent_meta.region_mem_types = [
-                nixl_agent_meta.region_mem_types[i] for i in remote_regions
-            ]
+        _select_remote_regions(nixl_agent_meta, remote_regions)
         if nixl_agent_meta.region_names is not None:
             nixl_agent_meta.region_names = list(self._transfer_layer_names)
         if nixl_agent_meta.packed_member_layouts:
@@ -2280,25 +2287,7 @@ class NixlBaseConnectorWorker:
             start = self._remote_region_offset
             end = start + num_local_regions
             assert len(nixl_agent_meta.kv_caches_base_addr) >= end
-            nixl_agent_meta.kv_caches_base_addr = nixl_agent_meta.kv_caches_base_addr[
-                start:end
-            ]
-            nixl_agent_meta.block_lens = nixl_agent_meta.block_lens[start:end]
-            nixl_agent_meta.block_strides = nixl_agent_meta.block_strides[start:end]
-            if nixl_agent_meta.region_num_blocks is not None:
-                nixl_agent_meta.region_num_blocks = nixl_agent_meta.region_num_blocks[
-                    start:end
-                ]
-            if nixl_agent_meta.region_group_ids is not None:
-                nixl_agent_meta.region_group_ids = nixl_agent_meta.region_group_ids[
-                    start:end
-                ]
-            if nixl_agent_meta.region_names is not None:
-                nixl_agent_meta.region_names = nixl_agent_meta.region_names[start:end]
-            if nixl_agent_meta.region_mem_types is not None:
-                nixl_agent_meta.region_mem_types = nixl_agent_meta.region_mem_types[
-                    start:end
-                ]
+            _select_remote_regions(nixl_agent_meta, range(start, end))
 
         ### Register remote engine in TransferTopology (idempotent).
         physical_blocks_per_logical = (
