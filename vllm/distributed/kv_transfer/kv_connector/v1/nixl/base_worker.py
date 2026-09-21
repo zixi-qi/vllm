@@ -1623,14 +1623,26 @@ class NixlBaseConnectorWorker:
                 virtual_transfer_pages = _uses_dense_virtual_transfer_pages(
                     layer_spec, cache, physical_page_size, num_blocks
                 )
+                # Packed MLA rows register one whole-row region per allocation,
+                # so a block moves as one descriptor rather than one per layer.
+                packed_mla_row = (
+                    self._has_packed_cache and packed_storage and is_mla_region
+                )
+                # A layer-name-routed PP producer addresses only its own MLA
+                # pages, so it takes the per-layer branch instead of whole rows.
+                routes_own_pages = use_layer_name_routing and is_mla_region
                 if virtual_transfer_pages:
                     # A compressed kernel row can contain multiple NIXL transfer pages.
                     region_specs = [
                         (cache.data_ptr(), physical_page_size, physical_page_size)
                     ]
-                elif storage_is_block_major and (
-                    (self._has_packed_cache and packed_storage and is_mla_region)
-                    or (not page_contiguous and not self._is_csa_linear)
+                elif (
+                    storage_is_block_major
+                    and not routes_own_pages
+                    and (
+                        packed_mla_row
+                        or (not page_contiguous and not self._is_csa_linear)
+                    )
                 ):
                     # TODO(Lucas): handle TP slicing for packed_storage; for now
                     # restrict to MLA (DSv4) where kv is replicated.
@@ -1639,27 +1651,19 @@ class NixlBaseConnectorWorker:
                         (registration_base, storage_block_len, storage_block_len)
                     ]
                     if track_region_layers and is_mla_region:
+                        # PP=1 keeps whole-row transfers, but advertises the
+                        # slice a PP producer needs to address this layer.
                         offset = cache.data_ptr() - storage_addr
                         assert (
                             offset >= 0 and offset + physical_page_size <= block_stride
                         )
-                        if use_layer_name_routing:
-                            # A PP producer transfers only its own layer pages.
-                            region_specs = [
-                                (
-                                    cache.data_ptr(),
-                                    physical_page_size,
-                                    block_stride,
-                                )
-                            ]
-                        else:
-                            # PP=1 keeps whole-row transfers, but advertises the
-                            # slices a PP producer needs to address this cache.
-                            packed_member_layouts[layer_name] = (
-                                offset,
-                                physical_page_size,
-                            )
+                        packed_member_layouts[layer_name] = (
+                            offset,
+                            physical_page_size,
+                        )
                 elif storage_is_block_major:
+                    # One strided region per layer. This is also the path a
+                    # layer-name-routed PP producer takes for its own MLA pages.
                     region_specs = [
                         (cache.data_ptr(), physical_page_size, block_stride)
                     ]
