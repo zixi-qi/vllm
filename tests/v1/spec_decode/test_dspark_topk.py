@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -100,7 +102,7 @@ def test_dspark_revisited_position_uses_step_seed(use_fp64):
         mapping,
         spec.temperature,
         spec.seeds,
-        positions - 1,
+        positions,
         apply_temperature=True,
         is_drafting=True,
         logits_cache=spec.draft_logits,
@@ -110,6 +112,113 @@ def test_dspark_revisited_position_uses_step_seed(use_fp64):
     torch.testing.assert_close(next_round, expected)
     mismatch_rate = (first != next_round).float().mean().item()
     assert 0.35 < mismatch_rate < 0.5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("probabilistic", [True, False])
+@pytest.mark.parametrize("reduced_vocab", [False, True])
+@pytest.mark.parametrize("num_reqs", [1, 3, 37])
+def test_markov_sampling_matches_adding_bias_first(
+    probabilistic: bool, reduced_vocab: bool, num_reqs: int
+):
+    """Every drafting mode gives the draft ids and cached draft logits of adding
+    the Markov bias first. Probabilistic full-vocab drafting adds it inside the
+    Gumbel kernel and writes the ids in place."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_steps, max_num_reqs, hidden, rank = 4, 64, 64, 32
+    # Not a multiple of the Gumbel kernel's block size.
+    draft_vocab = 3000
+    target_vocab = draft_vocab + 500 if reduced_vocab else draft_vocab
+    g = torch.Generator(device=device).manual_seed(num_reqs)
+
+    def randn(*shape: int, scale: float = 1.0) -> torch.Tensor:
+        x = torch.randn(*shape, generator=g, device=device)
+        return (x * scale).to(dtype)
+
+    # Unit-scale logits and bias, so most draws are not the argmax.
+    lm_head = randn(draft_vocab, hidden, scale=hidden**-0.5)
+    markov_w1 = randn(target_vocab, rank)
+    markov_w2 = randn(draft_vocab, rank, scale=rank**-0.5)
+    d2t = None
+    if reduced_vocab:
+        # Draft id i maps to target id i + d2t[i].
+        target_ids = torch.randperm(target_vocab, generator=g, device=device)
+        d2t = target_ids[:draft_vocab].sort().values
+        d2t -= torch.arange(draft_vocab, device=device)
+    head_hidden = randn(num_reqs * num_steps, hidden)
+    slots = torch.randperm(max_num_reqs, generator=g, device=device)[:num_reqs]
+    last_pos = torch.randint(10, 5000, (num_reqs, 1), generator=g, device=device)
+    # A mix of greedy and random requests.
+    temps = torch.tensor([0.0, 0.6, 1.0, 1.3], device=device)
+    temperature = temps[torch.randint(4, (max_num_reqs,), generator=g, device=device)]
+    seeds = torch.randint(2**62, (max_num_reqs,), generator=g, device=device)
+    input_ids = torch.randint(
+        target_vocab,
+        (max_num_reqs * num_steps,),
+        generator=g,
+        device=device,
+        dtype=torch.int32,
+    )
+
+    def make_speculator() -> DSparkSpeculator:
+        spec = DSparkSpeculator.__new__(DSparkSpeculator)
+        spec.model = SimpleNamespace(
+            compute_draft_logits=lambda h: h @ lm_head.T,
+            markov_embed=lambda ids: markov_w1[ids],
+            markov_bias=lambda e: e @ markov_w2.T,
+            map_draft_to_target=lambda ids: ids if d2t is None else ids + d2t[ids],
+        )
+        spec.num_speculative_steps = num_steps
+        spec._draft_topk = None
+        spec.use_confidence_head = False
+        spec.acceptance_estimator = None
+        spec.draft_watermarker = None
+        spec.use_fp64_gumbel = False
+        spec.temperature = temperature
+        spec.seeds = seeds
+        spec._step_cols = torch.arange(num_steps, dtype=torch.int32, device=device)
+        spec._anchor_idx = torch.arange(max_num_reqs, device=device) * num_steps
+        spec.sample_indices = torch.arange(num_reqs * num_steps, device=device)
+        spec.sample_idx_mapping = slots.repeat_interleave(num_steps).int()
+        spec.sample_pos = (last_pos + torch.arange(num_steps, device=device)).view(-1)
+        spec.input_buffers = SimpleNamespace(input_ids=input_ids)
+        spec.draft_tokens = torch.zeros(
+            max_num_reqs, num_steps, dtype=torch.int64, device=device
+        )
+        spec.draft_logits = None
+        spec._d2t_scatter_index = None
+        if probabilistic:
+            spec.draft_logits = torch.zeros(
+                max_num_reqs, num_steps, target_vocab, dtype=dtype, device=device
+            )
+        if probabilistic and d2t is not None:
+            spec._d2t_scatter_index = torch.arange(draft_vocab, device=device) + d2t
+            spec._draft_scatter_buf = torch.full(
+                (max_num_reqs, target_vocab), float("-inf"), dtype=dtype, device=device
+            )
+        return spec
+
+    fused, reference = make_speculator(), make_speculator()
+    fused._sample_sequential(num_reqs, head_hidden)
+    # The reference adds the bias to the logits before sampling, in every mode.
+    base_logits = reference.model.compute_draft_logits(head_hidden)
+    base_logits = base_logits.view(num_reqs, num_steps, -1)
+    idx_map = reference.sample_idx_mapping.view(num_reqs, num_steps)
+    draw_pos = reference.sample_pos.view(num_reqs, num_steps) - 1
+    prev = input_ids[reference._anchor_idx[:num_reqs]]
+    for i in range(num_steps):
+        bias = reference.model.markov_bias(reference.model.markov_embed(prev))
+        prev = reference._sample_logits(
+            base_logits[:, i] + bias, idx_map[:, i], draw_pos[:, i], i
+        )
+        reference.draft_tokens[:num_reqs, i] = prev
+
+    assert torch.equal(fused.draft_tokens, reference.draft_tokens)
+    if probabilistic:
+        draft_logits = fused.draft_logits
+        assert draft_logits is not None and draft_logits.any()
+        assert torch.equal(draft_logits, reference.draft_logits)
 
 
 @pytest.mark.parametrize("cuda_alike_platform", [False, True])

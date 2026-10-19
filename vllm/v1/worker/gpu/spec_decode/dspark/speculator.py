@@ -117,7 +117,7 @@ class DSparkSpeculator(DFlashSpeculator):
         self,
         logits: torch.Tensor,
         idx_map: torch.Tensor,
-        sample_pos: torch.Tensor,
+        draw_pos: torch.Tensor,
         step: int,
     ) -> torch.Tensor:
         self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
@@ -133,8 +133,6 @@ class DSparkSpeculator(DFlashSpeculator):
             buf.index_copy_(1, self._d2t_scatter_index, logits.to(buf.dtype))
             logits = buf
 
-        # sample_pos is the predicted token's position P. Sampling keys a draw
-        # by the position before the sampled token, P-1.
         sampler = (
             gumbel_sample
             if self.draft_watermarker is None
@@ -145,7 +143,7 @@ class DSparkSpeculator(DFlashSpeculator):
             idx_map,
             self.temperature,
             self.seeds,
-            sample_pos - 1,
+            draw_pos,
             apply_temperature=True,
             is_drafting=True,
             logits_cache=self.draft_logits,
@@ -170,6 +168,19 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        # Step-major, so every step reads contiguous rows. Draws are keyed by
+        # the position before the sampled token, P-1.
+        idx_map_steps = idx_map.t().contiguous()
+        draw_pos_steps = (sample_pos.t() - 1).contiguous()
+        # Greedy drafting, a reduced draft vocab, watermarking and the
+        # acceptance estimator need the biased logits. Otherwise the Gumbel
+        # kernel adds the Markov bias itself and writes the ids in place.
+        fuse_bias = (
+            self.draft_logits is not None
+            and self._d2t_scatter_index is None
+            and self.draft_watermarker is None
+            and self.acceptance_estimator is None
+        )
         confidence_markov_embeds = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
@@ -179,15 +190,28 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
-            if self.use_confidence_head:
-                confidence_markov_embeds.append(markov_embed)
+            confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
-            )
-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
-            prev = draft_sampled_i
+            if fuse_bias:
+                prev = gumbel_sample(
+                    base_logits[:, i],
+                    idx_map_steps[i],
+                    self.temperature,
+                    self.seeds,
+                    draw_pos_steps[i],
+                    apply_temperature=True,
+                    is_drafting=True,
+                    logits_cache=self.draft_logits,
+                    logits_cache_col=self._step_cols[i],
+                    use_fp64=self.use_fp64_gumbel,
+                    bias=bias,
+                    out=self.draft_tokens[:num_reqs, i],
+                )
+            else:
+                prev = self._sample_logits(
+                    base_logits[:, i] + bias, idx_map_steps[i], draw_pos_steps[i], i
+                )
+                self.draft_tokens[:num_reqs, i] = prev
 
         if self.use_confidence_head:
             confidence = self.model.compute_confidence(
@@ -233,7 +257,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 draft_indices[:, i],
             )
             draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
+                logits_i, idx_map[:, i], sample_pos[:, i] - 1, i
             )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i

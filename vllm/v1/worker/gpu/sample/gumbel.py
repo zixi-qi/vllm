@@ -233,6 +233,8 @@ def gumbel_block_argmax(
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr = False,
+    # Cache `logits` itself (e.g. after an in-kernel bias add), not the source.
+    CACHE_LOGITS: tl.constexpr = False,
 ):
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
     is_valid_req = req_state_idx >= 0
@@ -248,10 +250,15 @@ def gumbel_block_argmax(
             col = tl.load(logits_cache_col_ptr + token_idx)
         else:
             col = tl.load(logits_cache_col_ptr)
-        cached_logits = tl.load(
-            logits_cache_source_ptr + token_idx * logits_cache_source_stride + block,
-            mask=mask,
-        )
+        if CACHE_LOGITS:
+            cached_logits = logits
+        else:
+            cached_logits = tl.load(
+                logits_cache_source_ptr
+                + token_idx * logits_cache_source_stride
+                + block,
+                mask=mask,
+            )
         tl.store(
             logits_cache_ptr
             + req_state_idx * logits_cache_stride_0
@@ -293,6 +300,9 @@ def _gumbel_sample_kernel(
     logits_cache_source_stride,
     logits_ptr,
     logits_stride,
+    # [num_tokens, vocab_size], added to the logits
+    bias_ptr,
+    bias_stride,
     expanded_idx_mapping_ptr,
     seeds_ptr,
     pos_ptr,
@@ -303,6 +313,7 @@ def _gumbel_sample_kernel(
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
@@ -313,6 +324,10 @@ def _gumbel_sample_kernel(
         mask=mask,
         other=float("-inf"),
     )
+    if HAS_BIAS:
+        # Rounded to the logits dtype, as `logits + bias` would be.
+        bias = tl.load(bias_ptr + token_idx * bias_stride + block, mask=mask, other=0.0)
+        logits = (logits.to(tl.float32) + bias.to(tl.float32)).to(logits.dtype)
     logits = logits.to(tl.float32)
 
     value, idx = gumbel_block_argmax(
@@ -335,6 +350,7 @@ def _gumbel_sample_kernel(
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
+        CACHE_LOGITS=HAS_BIAS,
     )
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
@@ -353,6 +369,8 @@ def gumbel_sample(
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
     logits_cache_source: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,  # [num_tokens, vocab_size]
+    out: torch.Tensor | None = None,  # [num_tokens] int64, any stride
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
@@ -360,6 +378,11 @@ def gumbel_sample(
     if logits_cache_col is not None:
         logits_cache_col = logits_cache_col.contiguous()
     num_tokens, vocab_size = logits.shape
+    if bias is not None:
+        # The sum is rounded to the logits dtype: same dtype only. The kernel
+        # caches the biased logits it samples from.
+        assert bias.dtype == logits.dtype and bias.stride(-1) == 1
+        assert bias.shape == logits.shape and logits_cache_source is None
     if logits_cache is not None:
         if logits_cache_source is None:
             logits_cache_source = logits
@@ -400,6 +423,8 @@ def gumbel_sample(
         logits_cache_source.stride(0) if logits_cache_source is not None else 0,
         logits,
         logits.stride(0),
+        bias,
+        bias.stride(0) if bias is not None else 0,
         expanded_idx_mapping,
         seed,
         pos,
@@ -410,8 +435,13 @@ def gumbel_sample(
         APPLY_TEMPERATURE=apply_temperature,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,
+        HAS_BIAS=bias is not None,
     )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
-    sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
-    return sampled
+    if out is None:
+        out = logits.new_empty(num_tokens, dtype=torch.int64)
+    assert out.shape == (num_tokens,)
+    # Written in place, also into a strided column.
+    torch.gather(local_argmax, -1, max_block_idx, out=out.unsqueeze(-1))
+    return out
